@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build / installed application (large binaries; source is kept in main/, renderer/, assets/)
+dist/
+NovaTrade/
+
+# Local backups
+.bak*/
+*.bak
+*.bak_*
+
+# Local backtest data and run outputs
+bt/cache*/
+bt/run_*.json
+bt/last_run.json
+
+# Internal development notes (may include local paths, incident details, or private metrics)
+CHANGELOG_*.md
+功能扩展路线图_*.html
+bt/FWD_MONITOR.md
+bt/VERDICT_*.md
+
+# Local secrets, logs, and generated temporary files
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.dmp
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/

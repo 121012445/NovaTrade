@@ -1,0 +1,52 @@
+﻿const { contextBridge, ipcRenderer } = require('electron');
+
+try {
+  contextBridge.exposeInMainWorld('binanceAPI', {
+    getTickers: () => ipcRenderer.invoke('binance:getTickers'),
+    getKlines: (symbol, interval, limit, startTime) => ipcRenderer.invoke('binance:getKlines', symbol, interval, limit, startTime),
+    getPrice: (symbol) => ipcRenderer.invoke('binance:getPrice', symbol),
+    get24hrTicker: (symbol) => ipcRenderer.invoke('binance:get24hrTicker', symbol),
+    fwdLoad: () => ipcRenderer.invoke('fwd:load'),
+    fwdSave: (data) => ipcRenderer.invoke('fwd:save', data),
+    derivSnapshot: (symbol, period, limit) => ipcRenderer.invoke('deriv:snapshot', symbol, period, limit),
+    getExchangeInfo: () => ipcRenderer.invoke('binance:getExchangeInfo'),
+    getFuturesTickers: () => ipcRenderer.invoke('binance:getFuturesTickers'),
+    getFuturesKlines: (symbol, interval, limit) => ipcRenderer.invoke('binance:getFuturesKlines', symbol, interval, limit),
+    getFuturesPrice: (symbol) => ipcRenderer.invoke('binance:getFuturesPrice', symbol),
+    getFuturesSymbols: () => ipcRenderer.invoke('binance:getFuturesSymbols'),
+    fng: (limit) => ipcRenderer.invoke('alt:fng', limit),
+    getFuturesDepth: (symbol, limit) => ipcRenderer.invoke('binance:futuresDepth', symbol, limit),
+    getAggTrades: (symbol, limit) => ipcRenderer.invoke('binance:aggTrades', symbol, limit)
+  });
+  contextBridge.exposeInMainWorld('electronAPI', {
+    minimize: () => ipcRenderer.send('window:minimize'),
+    maximize: () => ipcRenderer.send('window:maximize'),
+    close: () => ipcRenderer.send('window:close'),
+    createWidget: () => ipcRenderer.invoke('widget:create'),
+    closeWidget: () => ipcRenderer.send('widget:close'),
+    onWidgetUpdate: (cb) => ipcRenderer.on('widget:data', (e, data) => cb(data)),
+    showMain: () => ipcRenderer.send('window:show'),
+    widgetUpdate: (data) => ipcRenderer.send('widget:update', data),
+    resizeWidget: (w, h) => ipcRenderer.send('widget:resize', w, h),
+    setWidgetAlwaysOnTop: (enabled) => ipcRenderer.send('widget:alwaysOnTop', enabled),
+    sendMessage: (msg) => ipcRenderer.send('renderer-msg', msg),
+    openDevTools: () => ipcRenderer.send('devtools:open'),
+    refresh: () => ipcRenderer.send('renderer:refresh'),
+    setProxy: (proxy) => ipcRenderer.invoke('futures:setProxy', proxy),
+    getProxy: () => ipcRenderer.invoke('futures:getProxy'),
+    setSpotProxy: (proxy) => ipcRenderer.invoke('spot:setProxy', proxy),
+    getSpotProxy: () => ipcRenderer.invoke('spot:getProxy'),
+    getProxyStatus: () => ipcRenderer.invoke('proxy:getStatus'),
+    redetectProxy: () => ipcRenderer.invoke('proxy:redetect'),
+    verifyProxy: () => ipcRenderer.invoke('proxy:verify'),
+    onProxyStatus: (cb) => ipcRenderer.on('proxy:status', (e, s) => cb(s)),
+    onWidgetCreated: (cb) => ipcRenderer.on('widget:created', () => cb()),
+    notify: (payload) => ipcRenderer.invoke('notify:show', payload),
+    exportCsv: (defaultName, text) => ipcRenderer.invoke('file:exportCsv', defaultName, text),
+    exportPng: (defaultName, dataUrl) => ipcRenderer.invoke('file:exportPng', defaultName, dataUrl),
+    setTrayStatus: (text) => ipcRenderer.invoke('tray:status', text)
+  });
+  console.log('[preload] OK');
+} catch(e) {
+  console.error('[preload] ERROR:', e.message);
+}

@@ -1,0 +1,63 @@
+{
+  "name": "nova-trade",
+  "version": "1.2.0",
+  "description": "NovaTrade - AI加密货币智能分析平台",
+  "main": "main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "author": "NovaTrade",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "lightweight-charts": "^5.2.1"
+  },
+  "build": {
+    "appId": "com.novatrade.app",
+    "productName": "NovaTrade",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main/index.js",
+      "main/preload.js",
+      "renderer/index.html",
+      "renderer/widget.html",
+      "renderer/lightweight-charts.js",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "NovaTrade",
+      "deleteAppDataOnUninstall": false,
+      "license": null,
+      "warningsAsErrors": false,
+      "include": "installer.nsh"
+    },
+    "artifactName": "${productName}-Setup-${version}.${ext}",
+    "asar": false
+  }
+}
