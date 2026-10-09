@@ -1,53 +1,18 @@
 'use strict';
-// 把 renderer/index.html 里的内联 <script> 放进 vm 沙箱执行，供单元测试直接调用其中的函数。
-// 与 bt/backtest.js 的 loadEngine 同思路。后续把评分逻辑拆成独立模块后，这个 helper 可以删掉。
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
+// 单元测试用：加载 renderer/lib/*.js + renderer/app.js 到 vm 沙箱（实现见 bt/engine.js）。
+const { loadEngine } = require('../bt/engine');
 
-const HTML = process.env.NT_HTML || path.resolve(__dirname, '..', 'renderer', 'index.html');
-
-function createStorage() {
-  const m = new Map();
-  return {
-    getItem: (k) => (m.has(k) ? m.get(k) : null),
-    setItem: (k, v) => { m.set(k, String(v)); },
-    removeItem: (k) => { m.delete(k); },
-    clear: () => m.clear()
-  };
-}
+const QUIET = { log() {}, warn() {}, error() {}, info() {} };
 
 // opts.binanceAPI：注入 window.binanceAPI（模拟主进程暴露的接口）
 function loadInline(opts) {
   const o = opts || {};
-  const html = fs.readFileSync(HTML, 'utf8');
-  const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-  const localStorage = createStorage();
-  const sandbox = {
-    window: { addEventListener: () => {}, binanceAPI: o.binanceAPI, localStorage },
-    document: {
-      addEventListener: () => {}, querySelectorAll: () => [], getElementById: () => null,
-      querySelector: () => null, createElement: () => ({})
-    },
-    localStorage,
-    console: o.console || { log() {}, warn() {}, error() {}, info() {} },
-    Math, JSON, Date, isFinite, parseFloat, parseInt, Number, String, Array, Object, Promise,
-    setTimeout, clearTimeout, setInterval, clearInterval
-  };
-  sandbox.window.window = sandbox.window;
-  vm.createContext(sandbox);
-  vm.runInContext(blocks.join('\n'), sandbox, { filename: 'novatrade-inline.js' });
-  // 与浏览器一致：顶层 function 声明是 window 的属性，detectPatterns 会被增强版覆盖
-  vm.runInContext('detectPatterns = window.detectPatterns;', sandbox);
-  return {
-    ctx: sandbox,
-    // 读取沙箱顶层标识符（含 const / let 声明的，如 Indicators）
-    get: (name) => vm.runInContext(name, sandbox)
-  };
+  const ctx = loadEngine({ includeApp: true, binanceAPI: o.binanceAPI, console: o.console || QUIET });
+  return { ctx, get: ctx.__get };
 }
 
 // 生成确定性的合成 K 线（币安原始格式：字符串价格 + closeTime 在第 7 项）
-// opts: { n, intervalMs, endOpenTime, start, drift, vol, lastOpen: 最后一根是否未收盘, lastCloseMul: 最后一根收盘价倍数 }
+// opts: { n, intervalMs, endOpenTime, start, drift, vol, lastCloseMul: 最后一根收盘价倍数 }
 function makeKlines(opts) {
   const n = opts.n, step = opts.intervalMs;
   let seed = opts.seed || 12345;

@@ -28,6 +28,8 @@
     "files": [
       "main/*.js",
       "renderer/index.html",
+      "renderer/app.js",
+      "renderer/lib/*.js",
       "renderer/widget.html",
       "renderer/lightweight-charts.js",
       "assets/**/*",
