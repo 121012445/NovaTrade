@@ -5,6 +5,7 @@
   "main": "main/index.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test",
     "build": "electron-builder"
   },
   "author": "NovaTrade",
@@ -25,10 +26,13 @@
       "output": "dist"
     },
     "files": [
-      "main/index.js",
-      "main/preload.js",
+      "main/*.js",
       "renderer/index.html",
+      "renderer/app.js",
+      "renderer/settings.js",
+      "renderer/lib/*.js",
       "renderer/widget.html",
+      "renderer/widget.js",
       "renderer/lightweight-charts.js",
       "assets/**/*",
       "package.json"

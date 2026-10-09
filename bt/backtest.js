@@ -5,14 +5,17 @@
 //   node backtest.js --top 30 --bars 2000 --interval 1h
 //   node backtest.js --baseline bt/last_run.json   与基线做 A/B 对比（唯一变量原则）
 // 设计参照 BinanceGUI backtestall: 固定宇宙+窗口+内置手续费+K线缓存+保守撮合(同bar先止损)
+// 信号只用已收盘 K 线，下一根开盘入场；默认数据源为合约（与应用一致），--market spot 可切到现货。
+// 阈值默认值直接取自应用常量（SIGNAL_LONG_MIN / SHORT_SCORE_MIN），避免与应用漂移。
 "use strict";
 const fs = require("fs");
 const path = require("path");
-const vm = require("vm");
+const { loadEngine } = require("./engine");   // 共享评分引擎（renderer/lib/*.js），不再从 index.html 里抠内联脚本
 const https = require("https");
 const http = require("http");
 
 // ---------- 参数 ----------
+const ENG = loadEngine({ console: { log() {}, warn() {}, error() {} } });
 const args = process.argv.slice(2);
 function argOf(name, def) { const i = args.indexOf(name); return i >= 0 && args[i + 1] ? args[i + 1] : def; }
 const TOP = parseInt(argOf("--top", "60"), 10);
@@ -21,10 +24,12 @@ const INTERVAL = argOf("--interval", "1h");
 const BASELINE = argOf("--baseline", null);
 const OUT = path.resolve(__dirname, argOf("--out", "last_run.json"));
 const CACHE_DIR = path.resolve(__dirname, argOf("--cache", "cache"));
-const PROXY = argOf("--proxy", "http://127.0.0.1:7897"); // 传 none 直连
+const PROXY = argOf("--proxy", process.env.NOVATRADE_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "none"); // none = 直连；也可用环境变量 NOVATRADE_PROXY / HTTPS_PROXY
+const MARKET = argOf("--market", "futures"); // futures（默认，与应用一致）| spot
 const FEE = 0.0004;            // 单边手续费（吃单），往返 0.08%
 const SL_ATR = 1.5, TP_ATR = 3.0, TIME_STOP = 24, COOLDOWN = 12, WINDOW = 300;
-const LONG_TH = parseInt(argOf("--long-th", "55"), 10), SHORT_TH = parseInt(argOf("--short-th", "45"), 10); // 与 App 推荐阈值一致
+const LONG_TH = parseInt(argOf("--long-th", String(ENG.SIGNAL_LONG_MIN)), 10);          // 默认 = 应用的多头门槛
+const SHORT_TH = parseInt(argOf("--short-th", String(ENG.SHORT_SCORE_MIN - 1)), 10);       // 默认 = 应用的空头门槛（score < SHORT_SCORE_MIN）
 const SHORT_HTF = argOf("--short-htf", "none"); // 如 4h：做空需高周期趋势同向下行(EMA20<EMA50)；none=关闭
 
 // ---------- 高周期趋势确认 ----------
@@ -49,8 +54,10 @@ function makeHtfGate(htfBars, htfInterval) {
 const PROXY_URL = /^none$/i.test(PROXY) ? null : new URL(PROXY);
 function getJSON(urlPath, host) {
   return new Promise((resolve, reject) => {
-    const hosts = host || ["data-api.binance.vision", "api.binance.com", "api1.binance.com", "api2.binance.com"];
-    let idx = 0;
+    const hosts = host || (MARKET === "futures"
+      ? ["fapi.binance.com", "fapi1.binance.com", "fapi2.binance.com", "fapi3.binance.com"]
+      : ["data-api.binance.vision", "api.binance.com", "api1.binance.com", "api2.binance.com"]);
+    let idx = 0, rateRetries = 0;
     const tryNext = () => {
       if (idx >= hosts.length) return reject(new Error("all hosts failed: " + urlPath));
       const h = hosts[idx++];
@@ -60,7 +67,19 @@ function getJSON(urlPath, host) {
         : { hostname: h, port: 443, path: urlPath, method: "GET", headers: { "User-Agent": "Mozilla/5.0" } };
       const req = (PROXY_URL && PROXY_URL.protocol === "https:" ? https : http).get(opts, (res) => {
         let data = ""; res.on("data", c => data += c);
-        res.on("end", () => { try { resolve(JSON.parse(data)); } catch (e) { tryNext(); } });
+        res.on("end", () => {
+          const st = res.statusCode;
+          if (st >= 200 && st < 300) { try { return resolve(JSON.parse(data)); } catch (e) { return tryNext(); } }
+          // 限流：按 Retry-After 等待后重试同一主机（最多 5 次），不要换主机继续猛打
+          if ((st === 429 || st === 418) && rateRetries++ < 5) {
+            const wait = Math.min(120, parseInt(res.headers["retry-after"], 10) || (st === 418 ? 60 : 10));
+            console.log("  限流 HTTP " + st + "，等待 " + wait + "s…");
+            idx--; return setTimeout(tryNext, wait * 1000);
+          }
+          // 4xx（参数 / 非法交易对 / 地区限制）换主机也不会好：直接报错
+          if (st >= 400 && st < 500) return reject(new Error("HTTP " + st + " " + String(data).slice(0, 120) + " " + urlPath));
+          tryNext();   // 5xx：换主机
+        });
       });
       req.on("error", tryNext);
       req.setTimeout(12000, () => { req.destroy(); tryNext(); });
@@ -70,33 +89,16 @@ function getJSON(urlPath, host) {
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ---------- 加载 App 评分引擎（index.html 内联脚本）----------
-function loadEngine() {
-  const html = fs.readFileSync(path.resolve(__dirname, "..", "renderer", "index.html"), "utf8");
-  const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-  const sandbox = {
-    window: { addEventListener: () => {} },
-    document: { addEventListener: () => {}, querySelectorAll: () => [], getElementById: () => null, querySelector: () => null },
-    console, Math, JSON, Date, isFinite, parseFloat, parseInt
-  };
-  sandbox.window.window = sandbox.window;
-  vm.createContext(sandbox);
-  vm.runInContext(blocks.join("\n"), sandbox, { filename: "novatrade-inline.js" });
-  // 浏览器里顶层 function 声明即 window 属性，detectPatterns 会被增强版覆盖；node 需手动对齐
-  vm.runInContext("detectPatterns = window.detectPatterns;", sandbox);
-  return sandbox;
-}
-
 // ---------- 宇宙与K线 ----------
 const STABLE = new Set(["USDC","BUSD","DAI","FDUSD","TUSD","USDP","USD1","RLUSD","USDS","UST","USTC","USDL","USDG","USDK","SUSD","USDX","MIM","FEI","USDF","BRLR"]);
 async function universe() {
-  const t = await getJSON("/api/v3/ticker/24hr");
+  const t = await getJSON(MARKET === "futures" ? "/fapi/v1/ticker/24hr" : "/api/v3/ticker/24hr");
   if (!Array.isArray(t)) throw new Error("tickers failed");
   return t.filter(s => s.symbol.endsWith("USDT") && !STABLE.has(s.symbol.slice(0, -4)))
     .map(s => ({ symbol: s.symbol, vol: parseFloat(s.quoteVolume) || 0 }))
     .filter(s => s.vol > 0).sort((a, b) => b.vol - a.vol).slice(0, TOP).map(s => s.symbol);
 }
-function cacheFile(sym, iv) { return path.join(CACHE_DIR, sym + "_" + (iv || INTERVAL) + ".json"); }
+function cacheFile(sym, iv) { return path.join(CACHE_DIR, MARKET + "_" + sym + "_" + (iv || INTERVAL) + ".json"); }
 async function klines(sym, iv) {
   const want = iv || INTERVAL;
   const cf = cacheFile(sym, want);
@@ -104,17 +106,23 @@ async function klines(sym, iv) {
     try { const c = JSON.parse(fs.readFileSync(cf, "utf8"));
       if (Date.now() - c.ts < 6 * 3600e3 && c.bars.length >= Math.min(BARS, 1000)) return c.bars; } catch (e) {}
   }
+  const PAGE = MARKET === "futures" ? 1500 : 1000;
   let bars = [], start = null, guard = 0;
-  while (bars.length < BARS && guard++ < 10) {
-    const p = "/api/v3/klines?symbol=" + encodeURIComponent(sym) + "&interval=" + want + "&limit=1000" + (start ? "&startTime=" + start : "");
+  // 无 startTime 时返回最近 PAGE 根；之后用上一页最后一根的时间向后翻页直到取够 BARS 根。
+  // 为了「取最近 BARS 根」，先按需要的根数反推起点。
+  const ivMs = msOf(want);
+  start = Date.now() - (BARS + 5) * ivMs;
+  while (bars.length < BARS && guard++ < 40) {
+    const base = MARKET === "futures" ? "/fapi/v1/klines" : "/api/v3/klines";
+    const p = base + "?symbol=" + encodeURIComponent(sym) + "&interval=" + want + "&limit=" + PAGE + "&startTime=" + start;
     const chunk = await getJSON(p);
     if (!Array.isArray(chunk) || chunk.length === 0) break;
     bars = bars.concat(chunk);
     start = chunk[chunk.length - 1][0] + 1;
-    if (chunk.length < 1000) break;
+    if (chunk.length < PAGE) break;
     await sleep(120);
   }
-  bars = bars.slice(-BARS);
+  bars = bars.filter(k => +k[6] < Date.now()).slice(-BARS);   // 只保留已收盘的 K 线
   try { fs.mkdirSync(CACHE_DIR, { recursive: true }); fs.writeFileSync(cf, JSON.stringify({ ts: Date.now(), bars })); } catch (e) {}
   return bars;
 }
@@ -131,9 +139,8 @@ function atr14(ohlc, i, n = 14) {
 
 // ---------- 回测主循环 ----------
 async function run() {
-  console.log(`加载评分引擎... (interval=${INTERVAL} top=${TOP} bars=${BARS} fee=${(FEE * 2 * 100).toFixed(2)}%往返)`);
-  const eng = loadEngine();
-  const analyzeCoin = eng.analyzeCoin;
+  console.log(`加载评分引擎... (market=${MARKET} interval=${INTERVAL} top=${TOP} bars=${BARS} fee=${(FEE * 2 * 100).toFixed(2)}%往返 阈值: 空≤${SHORT_TH} 多≥${LONG_TH})`);
+  const analyzeCoin = ENG.analyzeCoin;
   if (typeof analyzeCoin !== "function") throw new Error("analyzeCoin 未找到");
   const syms = await universe();
   console.log(`宇宙: ${syms.length} 个币 (按成交额 Top${TOP})`);
@@ -208,7 +215,7 @@ async function run() {
   for (const t of trades) { eq += t.pnlU; if (eq > peak) peak = eq; if (peak - eq > maxDD) maxDD = peak - eq; }
   const breakevenWR = (avgWin + avgLoss) > 0 ? avgLoss / (avgWin + avgLoss) * 100 : null;
   const result = {
-    meta: { interval: INTERVAL, top: TOP, bars: BARS, fee: FEE, slAtr: SL_ATR, tpAtr: TP_ATR, timeStop: TIME_STOP, cooldown: COOLDOWN, window: WINDOW, thresholds: [SHORT_TH, LONG_TH], shortHtf: SHORT_HTF, htfBlocked, htfPassed, generatedAt: new Date().toISOString() },
+    meta: { market: MARKET, interval: INTERVAL, top: TOP, bars: BARS, fee: FEE, slAtr: SL_ATR, tpAtr: TP_ATR, timeStop: TIME_STOP, cooldown: COOLDOWN, window: WINDOW, thresholds: [SHORT_TH, LONG_TH], shortHtf: SHORT_HTF, htfBlocked, htfPassed, generatedAt: new Date().toISOString() },
     metrics: { trades: n, winRate: n ? +(wins.length / n * 100).toFixed(1) : null,
       avgWin: +avgWin.toFixed(2), avgLoss: +avgLoss.toFixed(2), payoff: avgLoss ? +(avgWin / avgLoss).toFixed(2) : null,
       breakevenWR: breakevenWR === null ? null : +breakevenWR.toFixed(1),
