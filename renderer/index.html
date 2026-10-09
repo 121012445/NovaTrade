@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <!-- 所有网络请求均通过 IPC 由主进程发起，渲染层无需任何外部连接权限 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src wss://fstream.binance.com; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>NovaTrade - AI 智能分析</title>
 <style>
 /* ============================================================
@@ -1243,31 +1243,42 @@ const Indicators = {
     if (avgLoss === 0) return 100;
     return 100 - (100 / (1 + avgGain / avgLoss));
   },
+  // MACD 线 = EMA(fast) - EMA(slow)，返回与 closes 等长、下标对齐的数组（暂时算不出的位置为 null）
+  _macdLine(closes, fast, slow) {
+    const emaF = this._emaArr(closes, fast);
+    const emaS = this._emaArr(closes, slow);
+    if (!emaF || !emaS) return null;
+    return emaF.map((v, i) => (v !== null && emaS[i] !== null) ? v - emaS[i] : null);
+  },
   MACD(closes, fast = 12, slow = 26, signal = 9) {
     if (closes.length < slow) return null;
-    const emaF = this._emaArr(closes, fast);
-    const emaS = this._emaArr(closes, slow);
-    const macdLine = emaF.map((v, i) => v - emaS[i]);
-    const sigLine = this._emaArr(macdLine, signal);
-    return macdLine[macdLine.length - 1];
+    const line = this._macdLine(closes, fast, slow);
+    return line ? line[line.length - 1] : null;
   },
   MACDHist(closes, fast = 12, slow = 26, signal = 9) {
-    if (closes.length < slow) return null;
-    const emaF = this._emaArr(closes, fast);
-    const emaS = this._emaArr(closes, slow);
-    const macdLine = emaF.map((v, i) => v - emaS[i]);
-    const sigLine = this._emaArr(macdLine, signal);
-    return macdLine[macdLine.length - 1] - sigLine[sigLine.length - 1];
+    // 信号线是 MACD 线的 EMA(signal)，MACD 线从第 slow 根才有值，所以至少要 slow + signal - 1 根
+    if (closes.length < slow + signal - 1) return null;
+    const line = this._macdLine(closes, fast, slow);
+    if (!line) return null;
+    const sigLine = this._emaArr(line, signal);
+    if (!sigLine) return null;
+    return line[line.length - 1] - sigLine[sigLine.length - 1];
   },
+  // EMA 序列：与 arr 等长、下标对齐。首个 EMA 取前 period 个有效值的 SMA 作种子，种子之前为 null。
+  // arr 开头允许有 null（例如 MACD 线的前导空洞），种子从第一个有效值起算。
+  // 旧实现把结果整体右移了一位，且把 null 当 0 参与减法，污染了信号线（序列较短时偏差很大）。
   _emaArr(arr, period) {
-    if (arr.length < period) return null;
+    let start = 0;
+    while (start < arr.length && (arr[start] === null || !isFinite(arr[start]))) start++;
+    if (arr.length - start < period) return null;
     const k = 2 / (period + 1);
-    const result = [];
-    for (let i = 0; i < period; i++) result.push(null);
-    let ema = arr.slice(0, period).reduce((a, b) => a + b, 0) / period;
-    result.push(ema);
-    for (let i = period; i < arr.length; i++) { ema = arr[i] * k + ema * (1 - k); result.push(ema); }
-    return result;
+    const out = new Array(arr.length).fill(null);
+    let ema = 0;
+    for (let i = start; i < start + period; i++) ema += arr[i];
+    ema /= period;
+    out[start + period - 1] = ema;
+    for (let i = start + period; i < arr.length; i++) { ema = arr[i] * k + ema * (1 - k); out[i] = ema; }
+    return out;
   },
   BB(closes, period = 20, stdDev = 2) {
     if (closes.length < period) return null;
@@ -1755,10 +1766,12 @@ function detectAdvancedPatterns(ohlc) {
   return patterns;
 }
 
-function calcRiskReward(analysis, ohlc) {
+function calcRiskReward(analysis, ohlc, livePrice) {
   if (!analysis || !ohlc || ohlc.length < 20) return null;
   const last = ohlc[ohlc.length-1];
-  const price = last[4];
+  // ohlc 为已收盘 K 线（结构位 / ATR 的来源）；livePrice 为此刻的最新价，缺省时退回最后一根收盘价。
+  // 入场价必须是「现在能成交的价格」，否则 4h 基底下入场价最多会落后 4 小时。
+  const price = (isFinite(livePrice) && livePrice > 0) ? livePrice : last[4];
   const { supports, resistances } = findSupportResistance(ohlc);
   // ATR-based calculation
   const atrPeriod = 14;
@@ -2015,7 +2028,7 @@ async function fetchBTCAnalysis() {
     const mtf = await analyzeMultiTimeframe("BTC");
     if (mtf && mtf.score !== undefined) return mtf;
     // 兜底：多周期失败时退回原单周期 1h 分析
-    const kl = await window.binanceAPI.getKlines("BTCUSDT", "1h", 100);
+    const kl = await window.binanceAPI.getKlines("BTCUSDT", "1h", 100).then(r => Array.isArray(r) ? dropOpenCandle(r) : r);
     if (!kl || kl.__error || kl.length < 50) return null;
     const closes = kl.map(k => parseFloat(k[4]));
     return analyzeCoin(closes, "BTC", kl);
@@ -2155,24 +2168,44 @@ window.klineCachePrune = klineCachePrune;
 window.klineMarkFresh = klineMarkFresh;
 window.klineMarkStale = klineMarkStale;
 window.klinePaintFresh = klinePaintFresh;
-async function fetchKlines(t, e, i) { const sym = t.endsWith("USDT") ? t : t + "USDT";
+/* ===== 已收盘 K 线过滤 =====
+   币安返回的最后一根 K 线通常还在走（closeTime 在未来）。拿它算指标有两个问题：
+   ① 信号会随这根 K 线的每次跳动来回翻转（重绘）；
+   ② 量比 = 当前这根的量 / 前 20 根均量，K 线刚开始时量天然很小，放量信号会被系统性漏掉。
+   而回测只用已收盘 K 线，实盘不过滤就与回测口径不一致。
+   依据：原始 K 线第 7 项 closeTime（毫秒）。asOfMs 默认取当前时间；
+   用本地缓存兜底时要传「缓存写入时间」，否则当时还没走完的那根会被误判为已收盘。
+   注意：依赖本机时钟大致准确（系统时间被改快时会把未收盘 K 线误当已收盘）。 */
+function dropOpenCandle(rows, asOfMs) {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+  const last = rows[rows.length - 1];
+  const closeTime = Number(last && last[6]);
+  const asOf = isFinite(asOfMs) && asOfMs > 0 ? asOfMs : Date.now();
+  return (isFinite(closeTime) && closeTime >= asOf) ? rows.slice(0, -1) : rows;
+}
+window.dropOpenCandle = dropOpenCandle;
+// opts.closedOnly：只返回已收盘的 K 线（用于指标 / 筛选 / 信号）；默认保留最后一根未收盘 K 线（用于图表实时显示）
+async function fetchKlines(t, e, i, opts) { const sym = t.endsWith("USDT") ? t : t + "USDT";
   // 2026-10-09 第十批：本地缓存 + 离线兜底。成功就写缓存，失败就回退到上一次的缓存并打「离线数据」标。
   const tf = e || "1h", lim = i || 100;
+  const closedOnly = !!(opts && opts.closedOnly);
   const cacheKey = sym + "|" + tf + "|" + lim;
+  const toResult = function (rows, extra) {
+    const o = rows.map(k => [parseFloat(k[0]), parseFloat(k[1]), parseFloat(k[2]), parseFloat(k[3]), parseFloat(k[4]), parseFloat(k[5])]);
+    return Object.assign({ closes: o.map(k => k[4]), ohlc: o, timestamps: o.map(k => k[0]) }, extra || {});
+  };
   try {
     const s = await window.binanceAPI.getKlines(sym, tf, lim);
     if (!s || s.__error || !Array.isArray(s) || s.length === 0) throw new Error((s && s.__error) || "空数据");
-    const o = s.map(k => [parseFloat(k[0]), parseFloat(k[1]), parseFloat(k[2]), parseFloat(k[3]), parseFloat(k[4]), parseFloat(k[5])]);
-    klineCachePut(cacheKey, s);
+    klineCachePut(cacheKey, s);   // 缓存存原始数据（含未收盘那根），读取时再按 asOf 过滤
     klineMarkFresh();
-    return { closes: o.map(k => k[4]), ohlc: o, timestamps: o.map(k => k[0]) };
+    return toResult(closedOnly ? dropOpenCandle(s) : s);
   } catch (err) {
     const hit = klineCacheGet(cacheKey);
     if (hit) {
-      const o = hit.data.map(k => [parseFloat(k[0]), parseFloat(k[1]), parseFloat(k[2]), parseFloat(k[3]), parseFloat(k[4]), parseFloat(k[5])]);
       klineMarkStale(cacheKey, hit.ts);
       console.warn("[app] fetchKlines 回退本地缓存:", cacheKey, err && err.message);
-      return { closes: o.map(k => k[4]), ohlc: o, timestamps: o.map(k => k[0]), stale: true, cachedAt: hit.ts };
+      return toResult(closedOnly ? dropOpenCandle(hit.data, hit.ts) : hit.data, { stale: true, cachedAt: hit.ts });
     }
     console.error("[app] fetchKlines error:", err.message);
     return { closes: [], ohlc: [], timestamps: [] };
@@ -2188,7 +2221,12 @@ async function analyzeMultiTimeframe(symbol){
     const intervals=["15m","1h","4h"];
     const fetchList=intervals.concat(["1d"]); // 1d 仅用于支撑阻力结构，不参与评分加权
     const weights={"15m":0.25,"1h":0.35,"4h":0.40};
-    const allKl=await Promise.all(fetchList.map(iv=>window.binanceAPI.getKlines(sym,iv,iv==="1d"?120:150)));
+    const rawKl=await Promise.all(fetchList.map(iv=>window.binanceAPI.getKlines(sym,iv,iv==="1d"?120:150)));
+    // 评分 / 形态 / 支撑阻力只用「已收盘」K 线（与回测同口径，且不随未走完的那根来回重绘）；
+    // 现价单独取自最短周期最新一根（含未收盘），入场价 / 止损 / 前向验证记录都以它为准。
+    const allKl=rawKl.map(kl=>Array.isArray(kl)?dropOpenCandle(kl):kl);
+    let livePrice=NaN;
+    for(let q=0;q<rawKl.length&&!(livePrice>0);q++){ const r=rawKl[q]; if(Array.isArray(r)&&r.length) livePrice=parseFloat(r[r.length-1][4]); }
     const results=[];
     for(let i=0;i<intervals.length;i++){
       const kl=allKl[i];
@@ -2219,7 +2257,7 @@ async function analyzeMultiTimeframe(symbol){
     merged.dominance=Math.abs(aggScore-50)/50;
     merged.reasons=merged.signals.filter(s=>s.t!=="neutral").slice(0,5).map(s=>s.n);
     // 24h 涨跌幅用 1h 数据第 24 根近似
-    const kl1h=allKl[1];
+    const kl1h=rawKl[1];   // 24h 涨跌幅要的是「此刻 vs 24 根前」，用含未收盘的原始数据
     if(Array.isArray(kl1h)&&kl1h.length>=25){merged.change=(parseFloat(kl1h[kl1h.length-1][4])/parseFloat(kl1h[kl1h.length-25][4])-1)*100;}
     applyBtcRegime(merged);
     // 文案以 BTC 联动修正后的最终 score 为准，门槛用统一常量（与头部评级/方向同源）
@@ -2232,7 +2270,8 @@ async function analyzeMultiTimeframe(symbol){
     // 否则 merged.riskReward 残留基底周期的单方结论（其方向由 4h 单独评分决定），
     // 会出现"头部 34 分卖出、风险回报却给做多"的自相矛盾。结构位/ATR 仍取自高周期基底。
     const __rrOhlc=(merged.tfOhlc&&(merged.tfOhlc[merged.baseTf]||merged.tfOhlc["1h"]||merged.tfOhlc["4h"]))||null;
-    merged.riskReward=__rrOhlc?calcRiskReward(merged,__rrOhlc):null;
+    if(livePrice>0){ merged.price=livePrice; merged.livePrice=livePrice; }
+    merged.riskReward=__rrOhlc?calcRiskReward(merged,__rrOhlc,livePrice>0?livePrice:undefined):null;
     merged.fetchedAt=Date.now();
     window.__mtfCache[sym]={ts:Date.now(),data:merged};
     return merged;
@@ -2513,10 +2552,19 @@ function recordFwdSignals(analyses, skipShortSyms, skipLongSyms, sellGateDetail,
 }
 
 // 取目标时刻的历史价格（5m K线开盘价），结算不依赖 App 是否在线
+// 结算价的时间容差：K 线开盘时间离目标时刻超过这个值就不采用（新上市 / 停牌 / 下架后会取到很远的 K 线）
+const FWD_PRICE_TOLERANCE = 10 * 60e3;
+// 只有「目标时刻就在刚才」时才允许用现价顶替历史价；App 关闭了几小时再打开时，现价≠当时的价格
+const FWD_LIVE_FALLBACK_MAX_LAG = 10 * 60e3;
+// 超过这个时间仍取不到结算价的记录判定为「无数据」，不再重试，避免永远挂在待结算
+const FWD_EXPIRE_AFTER = 7 * 24 * 3600e3;
 async function fwdPriceAt(symbol, targetTs) {
   const sym = symbol.endsWith("USDT") ? symbol : symbol + "USDT";
   const kl = await window.binanceAPI.getKlines(sym, "5m", 1, targetTs);
-  if (Array.isArray(kl) && !kl.__error && kl.length > 0) return parseFloat(kl[0][1]);
+  if (Array.isArray(kl) && !kl.__error && kl.length > 0 && Math.abs(Number(kl[0][0]) - targetTs) <= FWD_PRICE_TOLERANCE) {
+    const px = parseFloat(kl[0][1]);
+    return px > 0 ? px : null;
+  }
   return null;
 }
 async function resolveFwdSignals() {
@@ -2539,7 +2587,8 @@ async function resolveFwdSignals() {
       const targetTs = key === "r1h" ? r.ts + FWD_1H : r.ts + FWD_4H;
       try {
         let px = await fwdPriceAt(r.symbol, targetTs);
-        if (!px) { // 兜底：K线拉不到（新上市/下架）退回现价结算
+        // 兜底：仅当目标时刻就在刚才（现价≈当时价）才用现价；否则宁可留着下个周期再取，也不拿现在的价冒充过去的价
+        if (!px && now - targetTs <= FWD_LIVE_FALLBACK_MAX_LAG) {
           const t = await window.binanceAPI.getPrice(r.symbol.endsWith("USDT") ? r.symbol : r.symbol + "USDT");
           if (t && t.price && !t.__error) px = parseFloat(t.price);
         }
@@ -2552,6 +2601,7 @@ async function resolveFwdSignals() {
       } catch(e) {}
     }
     if (r.r1h !== null && r.r4h !== null) r.resolved = true;
+    else if (age > FWD_EXPIRE_AFTER) { r.resolved = true; r.expired = true; changed = true; }   // 取不到结算价：标记无数据，不计入命中率
   }
   if (changed) await saveFwd();
 }
@@ -3669,7 +3719,7 @@ async function runScreener() {
     const cached = window.__screenerCache[sym + "|" + cfg.tf];
     if (cached && Date.now() - cached.ts < SCREENER_TTL) kl = cached.kl;
     else {
-      const r = await fetchKlines(sym, cfg.tf, 150);
+      const r = await fetchKlines(sym, cfg.tf, 150, { closedOnly: true });   // 筛选信号只看已收盘 K 线
       kl = r.ohlc;
       if (kl && kl.length) window.__screenerCache[sym + "|" + cfg.tf] = { ts: Date.now(), kl };
     }
@@ -3840,13 +3890,13 @@ function ledgerRows() {
   if (f === "long") rs = rs.filter(r => r.dir === "long");
   else if (f === "short") rs = rs.filter(r => r.dir === "short");
   else if (f === "settled") rs = rs.filter(r => r.r4h);
-  else if (f === "pending") rs = rs.filter(r => !r.r4h);
+  else if (f === "pending") rs = rs.filter(r => !r.r4h && !r.expired);
   else if (f === "filtered") rs = rs.filter(r => r.gated === false);
   rs.sort((a, b) => (b.ts || 0) - (a.ts || 0));
   return rs;
 }
-function ledgerCell(res, dir) {
-  if (!res) return "<span class=\"muted\">待结算</span>";
+function ledgerCell(res, dir, expired) {
+  if (!res) return "<span class=\"muted\">" + (expired ? "无数据" : "待结算") + "</span>";
   // 方向命中 = 多单涨 / 空单跌；收益按方向折算，避免"跌了但空单赚"被显示成亏损
   const signed = res.pct * (dir === "long" ? 1 : -1);
   const cls = res.hit ? "up" : "down";
@@ -3859,8 +3909,9 @@ function renderFwdLedger() {
   const all = fwdRecords || [];
   const rs = ledgerRows();
   const settled = all.filter(r => r.r4h).length;
+  const expiredN = all.filter(r => r.expired && !r.r4h).length;
   const head = ledgerFiltersHtml() +
-    "<div class=\"vp-note\" style=\"margin-bottom:10px\">共 " + all.length + " 条信号（已结算 " + settled + "，待结算 " + (all.length - settled) + "）；" +
+    "<div class=\"vp-note\" style=\"margin-bottom:10px\">共 " + all.length + " 条信号（已结算 " + settled + "，待结算 " + (all.length - settled - expiredN) + (expiredN ? "，无数据 " + expiredN : "") + "）；" +
     "「被门控拦下的」= 记录了但当时风控门控没放行，用来对比“记了但没做”的口径质量。点任意一行可回到该币技术分析。</div>";
   if (rs.length === 0) { box.innerHTML = head + "<div class=\"linked-empty\">该筛选下暂无记录。</div>"; return; }
   const rows = rs.slice(0, 300).map(function (r) {
@@ -3873,8 +3924,8 @@ function renderFwdLedger() {
       "<span class=\"ledger-td\">" + (isLong ? "多" : "空") + "</span>" +
       "<span class=\"ledger-td\">" + (r.score === undefined || r.score === null ? "--" : r.score) + "</span>" +
       "<span class=\"ledger-td\">" + formatPrice(r.price) + "</span>" +
-      "<span class=\"ledger-td\">" + ledgerCell(r.r1h, r.dir) + "</span>" +
-      "<span class=\"ledger-td\">" + ledgerCell(r.r4h, r.dir) + "</span>" +
+      "<span class=\"ledger-td\">" + ledgerCell(r.r1h, r.dir, r.expired) + "</span>" +
+      "<span class=\"ledger-td\">" + ledgerCell(r.r4h, r.dir, r.expired) + "</span>" +
       "<span class=\"ledger-td\">" + gate + "</span>" +
       "</div>";
   }).join("");
@@ -3896,8 +3947,8 @@ async function exportLedgerCsv() {
   const rows = rs.map(function (r) {
     const s = (res) => res ? (res.pct * (r.dir === "long" ? 1 : -1)).toFixed(3) : "";
     return [new Date(r.ts || 0).toISOString(), r.symbol, r.dir === "long" ? "多" : "空", r.score, r.price,
-      r.r1h ? (r.r1h.hit ? "命中" : "未中") : "待结算", s(r.r1h),
-      r.r4h ? (r.r4h.hit ? "命中" : "未中") : "待结算", s(r.r4h),
+      r.r1h ? (r.r1h.hit ? "命中" : "未中") : (r.expired ? "无数据" : "待结算"), s(r.r1h),
+      r.r4h ? (r.r4h.hit ? "命中" : "未中") : (r.expired ? "无数据" : "待结算"), s(r.r4h),
       r.gated === false ? "已拦截" : "放行"];
   });
   const csv = toCsv(["时间", "币种", "方向", "评分", "入场价", "1h判定", "1h方向收益%", "4h判定", "4h方向收益%", "门控"], rows);
@@ -4749,7 +4800,8 @@ async function dailyTrendData(symbol) {
   let down = true, up = true, below20 = false, above20 = false; // 拉取失败时保守放行两侧，与回测门控行为一致
   try {
     const kl = await window.binanceAPI.getKlines(sym, "1d", 60);
-    const closes = (kl && Array.isArray(kl) && !kl.__error) ? kl.map(k => parseFloat(k[4])) : [];
+    // 正在走的日线不参与（回测的 btDailyGateAt 也是只取已收盘日线，口径一致）
+    const closes = (kl && Array.isArray(kl) && !kl.__error) ? dropOpenCandle(kl).map(k => parseFloat(k[4])) : [];
     if (closes.length >= 50) {
       const e20 = emaSeries(closes, 20), e50 = emaSeries(closes, 50);
       const e20last = e20[e20.length - 1];
@@ -5606,7 +5658,8 @@ function renderRiskReward(symbol, a) {
   if (!srPanel) return;
   // 多周期与支撑阻力：1h/4h/1d 各周期距现价最近的水位；无多周期数据时退回原展示
   let srPrice = null;
-  if (a.tfOhlc) { const bTf = a.tfOhlc[a.baseTf] || a.tfOhlc["1h"] || a.tfOhlc["4h"]; if (bTf && bTf.length) srPrice = bTf[bTf.length-1][4]; }
+  if (a.livePrice > 0) srPrice = a.livePrice;
+  else if (a.tfOhlc) { const bTf = a.tfOhlc[a.baseTf] || a.tfOhlc["1h"] || a.tfOhlc["4h"]; if (bTf && bTf.length) srPrice = bTf[bTf.length-1][4]; }
   const multiSr = srPrice !== null ? multiTfSrHtml(a.tfOhlc, srPrice) : "";
   srPanel.innerHTML = "<div class='sr-header'>支撑/阻力 · 1h/4h/1d 最近水位</div>" + (multiSr ||
     "<div class='sr-row'><span class='sr-label'>暂无数据</span></div>");
@@ -7005,7 +7058,7 @@ window.fngHtml = fngHtml;
 
 // ========== ⑨ 盘口与强平：订单簿深度墙 / 大额成交（鲸鱼）/ 强平流 ==========
 window.__flow = window.__flow || { depth: null, whales: null, ts: 0, sym: "" };
-window.__liq = window.__liq || { ws: null, status: "idle", events: [], err: "" };
+window.__liq = window.__liq || { ws: null, status: "idle", events: [], err: "", manual: false, retry: 0, timer: null, nextRetryAt: 0 };
 var FLOW_TTL = 20000;
 
 function depthBuckets(levels, step, n) {
@@ -7101,7 +7154,9 @@ function liqStatsHtml() {
     '<div class="liq-tag">净差 <b>' + ((longLiq - shortLiq) / 1e6).toFixed(2) + 'M</b></div>' +
     '</div>';
   if (st === "error") {
-    html += '<div class="size-warn">强平流连不上。这是 WebSocket 实时流，需要代理支持 WS 隧道（本项目实测 Clash 7897 可以）。若持续失败，请检查代理是否开启了 WebSocket 转发。</div>';
+    var retryIn = (L.timer && L.nextRetryAt) ? Math.max(0, Math.ceil((L.nextRetryAt - now) / 1000)) : 0;
+    html += '<div class="size-warn">强平流连不上，' + (retryIn ? '约 ' + retryIn + ' 秒后自动重试（第 ' + (L.retry || 1) + ' 次）。' : '正在重试。') +
+      '这是 WebSocket 实时流，会跟随「设置」里的代理；若持续失败，请确认代理已开启并允许 WebSocket 转发。</div>';
   } else if (!ev.length) {
     html += '<div class="ai-rr-placeholder">还没收到强平事件。全市场强平流是稀疏事件，安静行情下几分钟没有一条很正常。</div>';
   } else {
@@ -7140,33 +7195,66 @@ function liqOnMessage(raw) {
   if (window.__liq.events.length > 300) window.__liq.events.length = 300;
   liqRepaint();
 }
-function liqConnect() {
+var LIQ_URL = "wss://fstream.binance.com/ws/!forceOrder@arr";
+function liqClearTimer() {
+  var L = window.__liq;
+  if (L.timer) { clearTimeout(L.timer); L.timer = null; }
+  L.nextRetryAt = 0;
+}
+// 断线后指数退避重连：2s → 4s → … → 60s 封顶，带少量抖动；用户手动断开后不再重连
+function liqScheduleReconnect() {
+  var L = window.__liq;
+  if (L.manual || L.timer) return;
+  L.retry = (L.retry || 0) + 1;
+  var delay = Math.min(60000, 1000 * Math.pow(2, Math.min(L.retry, 6))) + Math.floor(Math.random() * 500);
+  L.nextRetryAt = Date.now() + delay;
+  L.timer = setTimeout(function () { L.timer = null; L.nextRetryAt = 0; liqConnect(true); }, delay);
+}
+// 页面渲染时调用：没连上、也没在等待重连、用户也没手动断开，就发起一次连接
+function liqEnsure() {
+  var L = window.__liq;
+  if (!L.manual && !L.ws && !L.timer) liqConnect(true);
+}
+function liqConnect(isAuto) {
+  var L = window.__liq;
+  // 来自按钮的手动连接：清零退避计数；自动重连保留计数继续递增
+  if (!isAuto) { L.manual = false; L.retry = 0; }
+  liqClearTimer();
   try {
-    if (window.__liq.ws) return;
-    if (typeof WebSocket === "undefined") { window.__liq.status = "error"; window.__liq.err = "当前环境无 WebSocket"; liqRepaint(); return; }
-    window.__liq.status = "connecting";
-    window.__liq.err = "";
+    if (L.ws) return;
+    if (typeof WebSocket === "undefined") { L.status = "error"; L.err = "当前环境无 WebSocket"; liqRepaint(); return; }
+    L.status = "connecting";
+    L.err = "";
     liqRepaint();
-    var ws = new WebSocket("wss://fstream.binance.com/ws/!forceOrder@arr");
-    window.__liq.ws = ws;
-    ws.onopen = function () { window.__liq.status = "open"; liqRepaint(); };
+    var ws = new WebSocket(LIQ_URL);
+    L.ws = ws;
+    ws.onopen = function () { L.status = "open"; L.err = ""; L.retry = 0; liqRepaint(); };
     ws.onmessage = function (ev) { liqOnMessage(ev && ev.data); };
-    ws.onerror = function () { window.__liq.status = "error"; if (!window.__liq.err) window.__liq.err = "WebSocket 错误"; liqRepaint(); };
+    ws.onerror = function () { L.status = "error"; if (!L.err) L.err = "WebSocket 错误"; liqRepaint(); };
     ws.onclose = function () {
-      window.__liq.ws = null;
-      if (window.__liq.status !== "error") window.__liq.status = "closed";
+      if (L.ws === ws) L.ws = null;
+      if (L.manual) { L.status = "idle"; }
+      else {
+        if (L.status !== "error") L.status = "closed";
+        liqScheduleReconnect();
+      }
       liqRepaint();
     };
   } catch (e) {
-    window.__liq.status = "error";
-    window.__liq.err = e.message || String(e);
+    L.status = "error";
+    L.err = e.message || String(e);
+    L.ws = null;
+    liqScheduleReconnect();
     liqRepaint();
   }
 }
 function liqDisconnect() {
-  try { if (window.__liq.ws) window.__liq.ws.close(); } catch (e) {}
-  window.__liq.ws = null;
-  window.__liq.status = "idle";
+  var L = window.__liq;
+  L.manual = true;
+  liqClearTimer();
+  try { if (L.ws) L.ws.close(); } catch (e) {}
+  L.ws = null;
+  L.status = "idle";
   liqRepaint();
 }
 async function renderFlowPane(symbol) {
@@ -7202,7 +7290,7 @@ async function renderFlowPane(symbol) {
     ' <button class="btn-ghost" style="margin-left:auto" onclick="liqConnect()">连接</button>' +
     ' <button class="btn-ghost" onclick="liqDisconnect()">断开</button></div>' +
     '<div id="liqBox">' + liqStatsHtml() + '</div>';
-  if (window.__liq.status === "idle" || window.__liq.status === "closed") liqConnect();
+  liqEnsure();
 }
 function whaleMinChange(v) {
   var n = parseFloat(v);

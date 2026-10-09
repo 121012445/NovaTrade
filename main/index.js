@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, Notification, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, Notification, dialog, session } = require('electron');
 const path = require('path');
 
 app.commandLine.appendSwitch('disable-gpu');
@@ -120,6 +120,28 @@ function verifyProxy(proxyUrl) {
   });
 }
 
+// 把当前代理同步给 Chromium 会话。
+// 主进程的 REST 请求走自己的 CONNECT 隧道，但渲染进程里的 WebSocket（强平流）走 Chromium 网络栈，
+// 不会用到上面探测 / 配置的代理 —— 直连不通币安时连接必然失败。这里让两条链路用同一个代理。
+// 未配置代理时保持 Chromium 默认的系统代理行为。
+function proxyRulesFor(proxyUrl) {
+  try {
+    const u = new URL(proxyUrl);
+    let scheme = u.protocol.replace(':', '');
+    if (scheme === 'socks') scheme = 'socks5';
+    if (!['http', 'https', 'socks4', 'socks5'].includes(scheme)) return null;
+    return scheme + '://' + u.host;
+  } catch (e) { return null; }
+}
+async function applySessionProxy() {
+  try {
+    const rules = proxyRulesFor(futuresProxy || spotProxy);
+    if (rules) await session.defaultSession.setProxy({ proxyRules: rules, proxyBypassRules: '<local>' });
+    else await session.defaultSession.setProxy({ mode: 'system' });
+    log('[main] session proxy:', rules || 'system');
+  } catch (e) { fileLog('session-proxy', e.message); }
+}
+
 // 启动时初始化代理：优先用已保存配置，否则自动探测，最后校验是否真能通外网
 async function initProxy() {
   const hadConfig = loadProxyConfig();
@@ -211,137 +233,39 @@ function directKeepAliveAgent(maxSockets) {
   return agent;
 }
 
+// ===== 统一 REST 请求层（main/binance-http.js）=====
+// 检查 HTTP 状态码（429/418 限流退避、4xx 业务错误直接抛出、5xx/网络错误换主机重试）、
+// 同类接口并发上限、相同请求在途去重。所有币安 / 第三方 JSON 请求都走这里。
+const { createBinanceHttp } = require('./binance-http');
+const binanceHttp = createBinanceHttp({ log });
+
+const SPOT_HOSTS = [API_HOST, 'api.binance.com', 'api1.binance.com', 'api2.binance.com', 'api3.binance.com'];
+// 代理模式下 api.binance.com 系列更稳；直连（尤其国内）时 data-api.binance.vision 优先，避免先吃一次超时
+const SPOT_KLINE_HOSTS_PROXY = ['api.binance.com', 'api1.binance.com', 'api2.binance.com', 'api3.binance.com', API_HOST];
+const FUTURES_HOSTS = [FUTURES_API_HOST, 'fapi1.binance.com', 'fapi2.binance.com', 'fapi3.binance.com'];
+
+function agentFor(proxy, maxSockets) {
+  return proxy ? proxyTunnelAgent(proxy, maxSockets || 24) : directKeepAliveAgent(maxSockets || 24);
+}
+
+function binanceRequest(urlPath) {
+  return binanceHttp.requestJson({
+    family: 'spot', hosts: SPOT_HOSTS, path: urlPath,
+    agent: agentFor(spotProxy), proxyKey: spotProxy || 'direct', timeoutMs: 10000
+  });
+}
+
 function binanceKlinesRequest(urlPath) {
-  const hosts = ['api.binance.com', 'api1.binance.com', 'api2.binance.com', 'api3.binance.com'];
-  if (!spotProxy) {
-    return binanceRequest(urlPath);
-  }
-  return new Promise((resolve, reject) => {
-    let idx = 0;
-    function tryNext() {
-      if (idx >= hosts.length) return reject(new Error('All klines hosts failed'));
-      const host = hosts[idx++];
-      const options = {
-        hostname: host,
-        port: 443,
-        path: urlPath,
-        method: 'GET',
-        agent: proxyTunnelAgent(spotProxy, 24),
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-      };
-      const req = https.get(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); log('[main] klines OK:', host); }
-          catch(e) { log('[main] klines parse fail:', host); tryNext(); }
-        });
-      });
-      req.on('error', (e) => { log('[main] klines err:', host, e.message); tryNext(); });
-      req.setTimeout(8000, () => { req.destroy(); log('[main] klines timeout:', host); tryNext(); });
-    }
-    tryNext();
+  return binanceHttp.requestJson({
+    family: 'spot', hosts: spotProxy ? SPOT_KLINE_HOSTS_PROXY : SPOT_HOSTS, path: urlPath,
+    agent: agentFor(spotProxy), proxyKey: spotProxy || 'direct', timeoutMs: 10000
   });
 }
 
 function binanceFuturesRequest(urlPath) {
-  const hosts = ['fapi.binance.com', 'fapi1.binance.com', 'fapi2.binance.com', 'fapi3.binance.com'];
-  if (!futuresProxy) {
-    return new Promise((resolve, reject) => {
-      const options = { hostname: hosts[0], port: 443, path: urlPath, method: 'GET', agent: directKeepAliveAgent(24), headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' } };
-      const req = https.get(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(new Error('Parse')); } });
-      });
-      req.on('error', (e) => reject(e));
-      req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
-    });
-  }
-  return new Promise((resolve, reject) => {
-    let idx = 0;
-    function tryNext() {
-      if (idx >= hosts.length) return reject(new Error('All futures hosts failed'));
-      const host = hosts[idx++];
-      const options = {
-        hostname: host,
-        port: 443,
-        path: urlPath,
-        method: 'GET',
-        agent: proxyTunnelAgent(futuresProxy, 24),
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-      };
-      const req = https.get(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); log('[main] futures OK:', host); }
-          catch(e) { log('[main] futures parse fail:', host); tryNext(); }
-        });
-      });
-      req.on('error', (e) => { log('[main] futures err:', host, e.message); tryNext(); });
-      req.setTimeout(8000, () => { req.destroy(); log('[main] futures timeout:', host); tryNext(); });
-    }
-    tryNext();
-  });
-}
-
-function binanceRequest(urlPath, retries) {
-  retries = retries || 2;
-  return new Promise((resolve, reject) => {
-    if (spotProxy) {
-      const options = {
-        hostname: API_HOST,
-        port: 443,
-        path: urlPath,
-        method: 'GET',
-        agent: proxyTunnelAgent(spotProxy, 24),
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-          'Accept': 'application/json'
-        }
-      };
-      const req = https.get(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch(e) {
-            if (retries > 1) { log('[main] spot retry', urlPath); binanceRequest(urlPath, retries-1).then(resolve).catch(reject); }
-            else reject(new Error('Parse: ' + e.message));
-          }
-        });
-      });
-      req.on('error', (e) => {
-        if (retries > 1) { log('[main] spot retry', urlPath, e.message); binanceRequest(urlPath, retries-1).then(resolve).catch(reject); }
-        else reject(e);
-      });
-      req.setTimeout(15000, () => { req.destroy();
-        if (retries > 1) { log('[main] spot retry timeout', urlPath); binanceRequest(urlPath, retries-1).then(resolve).catch(reject); }
-        else reject(new Error('Spot Proxy Timeout'));
-      });
-    } else {
-      const options = { hostname: API_HOST, port: 443, path: urlPath, method: 'GET', agent: directKeepAliveAgent(24), headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' } };
-      const req = https.get(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch(e) {
-            if (retries > 1) { binanceRequest(urlPath, retries-1).then(resolve).catch(reject); }
-            else reject(new Error('Parse: ' + e.message));
-          }
-        });
-      });
-      req.on('error', (e) => {
-        if (retries > 1) { binanceRequest(urlPath, retries-1).then(resolve).catch(reject); }
-        else reject(e);
-      });
-      req.setTimeout(15000, () => { req.destroy();
-        if (retries > 1) { binanceRequest(urlPath, retries-1).then(resolve).catch(reject); }
-        else reject(new Error('Spot Timeout'));
-      });
-    }
+  return binanceHttp.requestJson({
+    family: 'futures', hosts: FUTURES_HOSTS, path: urlPath,
+    agent: agentFor(futuresProxy), proxyKey: futuresProxy || 'direct', timeoutMs: 10000
   });
 }
 
@@ -501,17 +425,23 @@ ipcMain.on('widget:alwaysOnTop', (e, enabled) => {
 // 渲染层通用消息通道（此前无接收方，仅落日志便于排查）
 ipcMain.on('renderer-msg', (e, msg) => { log('[main] renderer-msg:', msg); });
 
-ipcMain.handle('futures:setProxy', (e, proxy) => {
+ipcMain.handle('futures:setProxy', async (e, proxy) => {
+  // 渲染层传来的值不可信：只接受空字符串（直连）或 http/https/socks 代理地址
+  if (proxy && (typeof proxy !== 'string' || !proxyRulesFor(proxy))) return false;
   futuresProxy = proxy || '';
   log('[main] futures proxy set:', proxy || 'none');
   saveProxyConfig();
+  await applySessionProxy();
   return true;
 });
 ipcMain.handle('futures:getProxy', () => futuresProxy);
-ipcMain.handle('spot:setProxy', (e, proxy) => {
+ipcMain.handle('spot:setProxy', async (e, proxy) => {
+  // 渲染层传来的值不可信：只接受空字符串（直连）或 http/https/socks 代理地址
+  if (proxy && (typeof proxy !== 'string' || !proxyRulesFor(proxy))) return false;
   spotProxy = proxy || '';
   log('[main] spot proxy set:', proxy || 'none');
   saveProxyConfig();
+  await applySessionProxy();
   return true;
 });
 ipcMain.handle('spot:getProxy', () => spotProxy);
@@ -527,6 +457,7 @@ ipcMain.handle('proxy:redetect', async () => {
     error: ok ? '' : (detected ? '检测到的代理无法访问币安' : '未检测到可用代理，请手动配置')
   };
   saveProxyConfig();
+  await applySessionProxy();
   log('[main] proxy redetect:', proxyStatus.mode, detected || '(direct)', ok ? 'OK' : 'FAIL');
   return proxyStatus;
 });
@@ -545,15 +476,58 @@ ipcMain.handle('binance:getPrice', async (e, sym) => { try { const r = await bin
 ipcMain.handle('binance:get24hrTicker', async (e, sym) => { try { return await binanceRequest('/api/v3/ticker/24hr?symbol=' + encodeURIComponent(sym)); } catch(e) { log('[main] get24hrTicker error:', e.message); return { __error: e.message }; } });
 ipcMain.handle('binance:getExchangeInfo', async () => { try { return await binanceRequest('/api/v3/exchangeInfo'); } catch(e) { log('[main] getExchangeInfo error:', e.message); return { __error: e.message, symbols: [] }; } });
 ipcMain.handle('binance:getKlines', async (e, sym, interval, limit, startTime) => {
-  const qs = '&limit=' + (limit||100) + (startTime ? '&startTime=' + Math.floor(startTime) : '');
-  try { return await binanceFuturesRequest('/fapi/v1/klines?symbol=' + encodeURIComponent(sym) + '&interval=' + interval + qs); }
-  catch(e) { log('[main] getKlines futures fail, try spot:', e.message); try { return await binanceKlinesRequest('/api/v3/klines?symbol=' + encodeURIComponent(sym) + '&interval=' + interval + qs); } catch(e2) { log('[main] getKlines spot fail:', e2.message); return { __error: e2.message }; } }
+  const lim = limit || 100;
+  const st = startTime ? '&startTime=' + Math.floor(startTime) : '';
+  // 合约优先；合约不可用（无该永续合约 -1121 / 限流 / 网络）时回退现货。
+  // 现货 klines 单次上限 1000，合约上限 1500，回退时需要收敛 limit。
+  try { return await binanceFuturesRequest('/fapi/v1/klines?symbol=' + encodeURIComponent(sym) + '&interval=' + interval + '&limit=' + lim + st); }
+  catch(e) {
+    log('[main] getKlines futures fail, try spot:', e.message);
+    try { return await binanceKlinesRequest('/api/v3/klines?symbol=' + encodeURIComponent(sym) + '&interval=' + interval + '&limit=' + Math.min(lim, 1000) + st); }
+    catch(e2) { log('[main] getKlines spot fail:', e2.message); return { __error: e2.message }; }
+  }
 });
 
 // ===== 信号前向验证：记录持久化（userData/forward_validation.json）=====
 function fwdFile() { return path.join(app.getPath('userData'), 'forward_validation.json'); }
-ipcMain.handle('fwd:load', () => { try { return JSON.parse(fs.readFileSync(fwdFile(), 'utf8')); } catch(e) { return []; } });
-ipcMain.handle('fwd:save', (e, data) => { try { fs.writeFileSync(fwdFile(), JSON.stringify(data)); return true; } catch(e) { log('[main] fwd save error:', e.message); fileLog('fwd-save', e.message); return false; } });
+const FWD_MAX_RECORDS = 50000;
+function readFwdFile(f) {
+  const arr = JSON.parse(fs.readFileSync(f, 'utf8'));
+  if (!Array.isArray(arr)) throw new Error('not an array');
+  return arr;
+}
+ipcMain.handle('fwd:load', () => {
+  const f = fwdFile();
+  if (!fs.existsSync(f)) return [];
+  try { return readFwdFile(f); }
+  catch (err) {
+    // 文件损坏：先把坏文件改名留证（避免后续保存把它覆盖成空数组，造成静默丢数据），再尝试读备份
+    fileLog('fwd-load', 'corrupt forward_validation.json: ' + err.message);
+    try { fs.renameSync(f, f + '.corrupt-' + Date.now()); } catch (e) {}
+    try { const bak = readFwdFile(f + '.bak'); fileLog('fwd-load', 'recovered from .bak, records=' + bak.length); return bak; }
+    catch (e) { return []; }
+  }
+});
+// 写入串行化 + 原子替换：先写临时文件，再 rename 覆盖，崩溃 / 断电时不会留下写了一半的 JSON
+let fwdWriteChain = Promise.resolve();
+function fwdWriteAtomic(json) {
+  const f = fwdFile(), tmp = f + '.tmp';
+  return fs.promises.writeFile(tmp, json, 'utf8')
+    .then(() => fs.promises.copyFile(f, f + '.bak').catch(() => {}))   // 首次保存没有旧文件，忽略
+    .then(() => fs.promises.rename(tmp, f));
+}
+ipcMain.handle('fwd:save', (e, data) => {
+  // 渲染层传来的数据不可信：必须是不太大的对象数组
+  if (!Array.isArray(data) || data.length > FWD_MAX_RECORDS || !data.every((r) => r && typeof r === 'object' && !Array.isArray(r))) {
+    fileLog('fwd-save', 'rejected invalid payload');
+    return false;
+  }
+  let json;
+  try { json = JSON.stringify(data); } catch (err) { fileLog('fwd-save', 'stringify: ' + err.message); return false; }
+  const run = () => fwdWriteAtomic(json).then(() => true, (err) => { log('[main] fwd save error:', err.message); fileLog('fwd-save', err.message); return false; });
+  fwdWriteChain = fwdWriteChain.then(run, run);
+  return fwdWriteChain;
+});
 
 // ===== 衍生品资金面：一次取齐 5 组数据（纯只读，不参与任何评分/下单）=====
 // 全部走 binanceFuturesRequest，自动复用代理与多主机回退。
@@ -583,19 +557,9 @@ ipcMain.handle('deriv:snapshot', async (e, symRaw, period, limit) => {
 // 应用定位始终是"分析辅助工具"，不参与实盘交易。
 // 通用 JSON 请求：给币安以外的第三方源用，同样复用已探测到的代理
 function genericJsonRequest(host, urlPath, proxyUrl, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const opts = {
-      hostname: host, port: 443, path: urlPath, method: 'GET',
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-    };
-    opts.agent = proxyUrl ? proxyTunnelAgent(proxyUrl, 6) : directKeepAliveAgent(6);
-    const req = https.get(opts, (res) => {
-      let data = '';
-      res.on('data', (c) => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('Parse failed')); } });
-    });
-    req.on('error', (e) => reject(e));
-    req.setTimeout(timeoutMs || 10000, () => { req.destroy(); reject(new Error('Timeout')); });
+  return binanceHttp.requestJson({
+    family: 'generic:' + host, hosts: [host], path: urlPath,
+    agent: agentFor(proxyUrl, 6), proxyKey: proxyUrl || 'direct', timeoutMs: timeoutMs || 10000
   });
 }
 // ① 恐惧贪婪指数（alternative.me，免费无 key，与币安评分体系完全独立）
@@ -699,6 +663,7 @@ app.whenReady().then(async () => {
   // 先完成代理初始化（读配置 → 自动探测 → 校验），再创建窗口，
   // 保证渲染层首次请求就带上正确的代理设置，避免启动瞬间请求全部失败
   try { await initProxy(); } catch (e) { fileLog('proxy-init-fail', e.message); }
+  await applySessionProxy();
   createWindow();
   // 页面加载完成后把代理状态推给渲染层（用于显示"代理未开启"提示）
   if (mainWindow) {
