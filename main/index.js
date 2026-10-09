@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, Notification, dialog, session } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, Notification, dialog, session, safeStorage } = require('electron');
 const path = require('path');
 
 // GPU：默认启用硬件加速；只有显式要求或 GPU 进程连续崩溃时才降级为软件渲染（见 main/gpu-config.js）。
@@ -528,7 +528,42 @@ function safe(tag, fn, extra) {
     catch (err) { log('[main] ' + tag + ' error:', err.message); return Object.assign({ __error: err.message }, extra || {}); }
   };
 }
-ipcHandle('binance:getTickers', safe('getTickers', () => binanceRequest('/api/v3/ticker/24hr')));
+// ===== 数据源：币安为主，OKX 现货公开行情为备用 =====
+// 只有「币安整体不可用」（网络 / 5xx / 限流）才会切到备用源；币安明确拒绝的请求（如非法交易对）不会切换。
+// 备用源只覆盖现货 USDT 对（见 main/okx.js），切换后用 data:source 告诉界面「当前数据来自备用源」。
+const { createOkx } = require('./okx');
+const okx = createOkx((host, urlPath) => binanceHttp.requestJson({
+  family: 'okx', hosts: [host], path: urlPath, agent: agentFor(spotProxy), proxyKey: spotProxy || 'direct', timeoutMs: 10000
+}));
+let dataSource = { name: 'binance', at: 0 };
+function noteSource(name) { dataSource = { name, at: Date.now() }; }
+const isDefinitive = (e) => !!(e && e.kind === 'client');
+
+async function spotTickers() {
+  try { const r = await binanceRequest('/api/v3/ticker/24hr'); noteSource('binance'); return r; }
+  catch (e) {
+    if (isDefinitive(e)) throw e;
+    try { const r = await okx.tickers(); noteSource('okx'); log('[main] tickers: fell back to OKX (' + e.message + ')'); return r; }
+    catch (e2) { throw e; }
+  }
+}
+// 一页 K 线：合约优先，合约不可用时回退现货（现货单次上限 1000，合约 1500）；两者都不可用时再试 OKX（仅最近 300 根）
+async function fetchKlinesPage(sym, iv, lim, startMs) {
+  const st = startMs ? '&startTime=' + startMs : '';
+  try { const r = await binanceFuturesRequest('/fapi/v1/klines?symbol=' + sym + '&interval=' + iv + '&limit=' + lim + st); noteSource('binance'); return r; }
+  catch (err) {
+    log('[main] klines futures fail, try spot:', err.message);
+    try { const r = await binanceKlinesRequest('/api/v3/klines?symbol=' + sym + '&interval=' + iv + '&limit=' + Math.min(lim, 1000) + st); noteSource('binance'); return r; }
+    catch (err2) {
+      log('[main] klines spot fail:', err2.message);
+      if (isDefinitive(err2) || startMs) throw err2;          // 带起点的历史分页不走备用源（OKX 备用只有最近 300 根）
+      try { const r = await okx.klines(sym, iv, lim); noteSource('okx'); return r; }
+      catch (err3) { throw err2; }
+    }
+  }
+}
+ipcHandle('data:source', () => dataSource);
+ipcHandle('binance:getTickers', safe('getTickers', () => spotTickers()));
 ipcHandle('binance:getFuturesTickers', safe('getFuturesTickers', () => binanceFuturesRequest('/fapi/v1/ticker/24hr')));
 ipcHandle('binance:getFuturesPrice', safe('getFuturesPrice', async (symRaw) => {
   const sym = V.symbol(symRaw); if (!sym) return bad('symbol', { price: '0' });
@@ -552,17 +587,27 @@ ipcHandle('binance:getExchangeInfo', safe('getExchangeInfo', () => binanceReques
 ipcHandle('binance:getKlines', async (e, symRaw, ivRaw, limitRaw, startRaw) => {
   const sym = V.symbol(symRaw), iv = V.interval(ivRaw);
   if (!sym) return bad('symbol'); if (!iv) return bad('interval');
-  const lim = V.int(limitRaw, 1, 1500, 100);
-  const stMs = V.timestamp(startRaw);
-  const st = stMs ? '&startTime=' + stMs : '';
-  // 合约优先；合约不可用（无该永续合约 -1121 / 限流 / 网络）时回退现货。
-  // 现货 klines 单次上限 1000，合约上限 1500，回退时需要收敛 limit。
-  try { return await binanceFuturesRequest('/fapi/v1/klines?symbol=' + sym + '&interval=' + iv + '&limit=' + lim + st); }
-  catch(err) {
-    log('[main] getKlines futures fail, try spot:', err.message);
-    try { return await binanceKlinesRequest('/api/v3/klines?symbol=' + sym + '&interval=' + iv + '&limit=' + Math.min(lim, 1000) + st); }
-    catch(err2) { log('[main] getKlines spot fail:', err2.message); return { __error: err2.message }; }
+  try { return await fetchKlinesPage(sym, iv, V.int(limitRaw, 1, 1500, 100), V.timestamp(startRaw)); }
+  catch (err) { return { __error: err.message }; }
+});
+
+// ===== 本地历史 K 线库（长周期回测用，见 main/kline-store.js）=====
+const { createKlineStore } = require('./kline-store');
+let klineStore = null;
+function getKlineStore() {
+  if (!klineStore) {
+    klineStore = createKlineStore({
+      dir: path.join(app.getPath('userData'), 'klines'), pageSize: 1000, log,
+      fetchPage: (sym, iv, start, limit) => fetchKlinesPage(sym, iv, limit, start)
+    });
   }
+  return klineStore;
+}
+ipcHandle('history:get', async (e, symRaw, ivRaw, barsRaw) => {
+  const sym = V.symbol(symRaw), iv = V.interval(ivRaw);
+  if (!sym) return bad('symbol'); if (!iv) return bad('interval');
+  try { return (await getKlineStore().get(sym, iv, V.int(barsRaw, 100, 200000, 2000))).rows; }
+  catch (err) { log('[main] history error:', err.message); return { __error: err.message }; }
 });
 
 // ===== 信号前向验证：记录持久化（userData/forward_validation.json）=====
@@ -684,26 +729,24 @@ ipcHandle('notify:show', (e, payload) => {
 });
 
 // ===== 导出：CSV / PNG（弹系统保存对话框，由用户选路径）=====
-function saveWithDialog(kind, defaultName, dataOrBase64, encoding) {
+const SAVE_KINDS = {
+  csv: { title: '导出 CSV', filters: [{ name: 'CSV', extensions: ['csv'] }] },
+  png: { title: '导出图片', filters: [{ name: 'PNG 图片', extensions: ['png'] }] },
+  json: { title: '导出备份', filters: [{ name: 'JSON', extensions: ['json'] }] },
+  txt: { title: '导出诊断包', filters: [{ name: '文本', extensions: ['txt'] }] }
+};
+function saveWithDialog(kind, defaultName, dataOrBase64) {
   return new Promise((resolve) => {
     try {
-      const filters = kind === 'csv'
-        ? [{ name: 'CSV', extensions: ['csv'] }]
-        : [{ name: 'PNG 图片', extensions: ['png'] }];
-      const target = dialog.showSaveDialog(mainWindow || undefined, {
-        title: kind === 'csv' ? '导出 CSV' : '导出图片',
-        defaultPath: defaultName,
-        filters
-      });
+      const k = SAVE_KINDS[kind];
+      if (!k) return resolve({ ok: false, error: 'unsupported kind' });
+      const target = dialog.showSaveDialog(mainWindow || undefined, { title: k.title, defaultPath: defaultName, filters: k.filters });
       Promise.resolve(target).then((res) => {
         if (!res || res.canceled || !res.filePath) return resolve({ ok: false, canceled: true });
         try {
-          if (kind === 'csv') {
-            // 加 BOM，否则 Excel 打开中文会乱码
-            fs.writeFileSync(res.filePath, '\ufeff' + String(dataOrBase64), 'utf8');
-          } else {
-            fs.writeFileSync(res.filePath, Buffer.from(String(dataOrBase64).replace(/^data:image\/png;base64,/, ''), 'base64'));
-          }
+          if (kind === 'csv') fs.writeFileSync(res.filePath, '\ufeff' + String(dataOrBase64), 'utf8');   // 加 BOM，否则 Excel 打开中文会乱码
+          else if (kind === 'png') fs.writeFileSync(res.filePath, Buffer.from(String(dataOrBase64).replace(/^data:image\/png;base64,/, ''), 'base64'));
+          else fs.writeFileSync(res.filePath, String(dataOrBase64), 'utf8');
           log('[main] exported ->', res.filePath);
           resolve({ ok: true, path: res.filePath });
         } catch (err) { log('[main] export write error:', err.message); resolve({ ok: false, error: err.message }); }
@@ -719,6 +762,68 @@ ipcHandle('file:exportCsv', (e, defaultName, text) => {
 ipcHandle('file:exportPng', (e, defaultName, dataUrl) => {
   if (typeof dataUrl !== 'string' || dataUrl.length > EXPORT_MAX_CHARS || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) return { ok: false, error: 'invalid or too large payload' };
   return saveWithDialog('png', V.fileName(defaultName, 'novatrade.png'), dataUrl);
+});
+
+// ===== 远程推送 / AI 解读 / 备份 / 诊断 / 更新检查 =====
+// 这些功能的凭据（推送令牌、API Key）都用 safeStorage 加密落盘；渲染进程只能读到打码值。
+const { createPush } = require('./push');
+const { createLlm } = require('./llm');
+const diag = require('./diagnostics');
+const UPDATE_REPO = '121012445/NovaTrade';
+let pushSvc = null, llmSvc = null;
+const agentForUse = (useProxy) => (useProxy ? agentFor(futuresProxy || spotProxy, 6) : directKeepAliveAgent(6));
+function getPush() {
+  if (!pushSvc) pushSvc = createPush({ safeStorage, file: path.join(app.getPath('userData'), 'push_config.json'), getAgent: agentForUse, log });
+  return pushSvc;
+}
+function getLlm() {
+  if (!llmSvc) llmSvc = createLlm({ safeStorage, file: path.join(app.getPath('userData'), 'llm_config.json'), getAgent: agentForUse, log });
+  return llmSvc;
+}
+ipcHandle('push:getConfig', () => getPush().getPublicConfig());
+ipcHandle('push:setConfig', (e, cfg) => getPush().setConfig(cfg));
+ipcHandle('push:send', (e, msg) => { getPush().send(msg).catch((err) => log('[main] push error:', err.message)); return true; });   // 即发即忘
+ipcHandle('push:test', (e, id) => getPush().test(typeof id === 'string' ? id : undefined));
+ipcHandle('llm:getConfig', () => getLlm().getPublicConfig());
+ipcHandle('llm:setConfig', (e, cfg) => getLlm().setConfig(cfg));
+ipcHandle('llm:analyze', (e, payload) => getLlm().analyze(payload));
+
+ipcHandle('app:info', () => ({ version: app.getVersion(), packaged: app.isPackaged, platform: process.platform, softwareRendering: SOFTWARE_RENDER }));
+ipcHandle('update:check', async () => {
+  return diag.checkUpdate({
+    repo: UPDATE_REPO, current: app.getVersion(),
+    request: (host, urlPath) => binanceHttp.requestJson({ family: 'generic:' + host, hosts: [host], path: urlPath, agent: agentFor(futuresProxy || spotProxy, 2), proxyKey: futuresProxy || spotProxy || 'direct', timeoutMs: 10000 })
+  });
+});
+ipcHandle('diagnostics:export', async () => {
+  let errorLog = '';
+  try { errorLog = fs.readFileSync(ensureLogFile(), 'utf8'); } catch (err) { /* 还没有日志 */ }
+  const report = diag.buildReport({
+    versions: { app: app.getVersion(), electron: process.versions.electron, chrome: process.versions.chrome, node: process.versions.node, platform: process.platform + ' ' + process.arch, packaged: app.isPackaged },
+    proxyStatus, gpu: Object.assign({ softwareRenderingNow: SOFTWARE_RENDER }, GPU_CONFIG),
+    extra: { dataSource, pushConfigured: getPush().getPublicConfig().channels.length, llmConfigured: getLlm().getPublicConfig().configured },
+    errorLog, maxLogBytes: 200 * 1024
+  });
+  return saveWithDialog('txt', 'novatrade-diagnostics-' + new Date().toISOString().slice(0, 10) + '.txt', report);
+});
+
+// 备份：渲染层把需要备份的本地数据（自选 / 预警 / 持仓 / 日志 / 设置 / 前向验证记录）序列化成 JSON 交给主进程保存；
+// 恢复时主进程只负责弹框读文件并校验大小 / 结构，应用到哪些键由渲染层按白名单决定。
+const BACKUP_MAX_BYTES = 30 * 1024 * 1024;
+ipcHandle('backup:export', (e, json, name) => {
+  if (typeof json !== 'string' || json.length > BACKUP_MAX_BYTES) return { ok: false, error: 'invalid or too large payload' };
+  return saveWithDialog('json', V.fileName(name, 'novatrade-backup.json'), json);
+});
+ipcHandle('backup:import', async () => {
+  try {
+    const res = await dialog.showOpenDialog(mainWindow || undefined, { title: '导入备份', properties: ['openFile'], filters: [{ name: 'JSON', extensions: ['json'] }] });
+    if (!res || res.canceled || !res.filePaths || !res.filePaths[0]) return { ok: false, canceled: true };
+    const f = res.filePaths[0];
+    if (fs.statSync(f).size > BACKUP_MAX_BYTES) return { ok: false, error: '文件过大' };
+    const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return { ok: false, error: '不是有效的备份文件' };
+    return { ok: true, data };
+  } catch (err) { return { ok: false, error: '读取失败：' + err.message }; }
 });
 
 // ===== 单实例限制：同一时间只允许运行一个 NovaTrade =====

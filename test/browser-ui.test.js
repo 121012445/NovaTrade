@@ -74,24 +74,26 @@ test('注入的内联脚本与内联事件属性不会执行', { skip }, async (
 
 test('强平流：断线后指数退避自动重连；手动断开后不再重连', { skip }, async () => {
   const { page } = await open();
+  // 应用启动时还会为实时行情创建一个 WebSocket，这里只看强平流那一个
+  const L = "window.__sockets.filter(function (s) { return /forceOrder/.test(s.url); })";
   await page.evaluate(() => window.liqConnect());
-  assert.equal(await page.evaluate(() => window.__sockets.length), 1);
-  assert.match(await page.evaluate(() => window.__sockets[0].url), /^wss:\/\/fstream\.binance\.com\/ws\/!forceOrder@arr$/);
-  await page.evaluate(() => window.__sockets[0].onopen());
+  assert.equal(await page.evaluate(`${L}.length`), 1);
+  assert.match(await page.evaluate(`${L}[0].url`), /^wss:\/\/fstream\.binance\.com\/ws\/!forceOrder@arr$/);
+  await page.evaluate(`${L}[0].onopen()`);
   assert.equal(await page.evaluate(() => window.__liq.status), 'open');
   // 收到一条强平消息
-  await page.evaluate(() => window.__sockets[0].onmessage({ data: JSON.stringify({ o: { s: 'BTCUSDT', S: 'SELL', ap: '100', z: '5', T: Date.now() } }) }));
+  await page.evaluate(`${L}[0].onmessage({ data: JSON.stringify({ o: { s: 'BTCUSDT', S: 'SELL', ap: '100', z: '5', T: Date.now() } }) })`);
   assert.equal(await page.evaluate(() => window.__liq.events.length), 1);
   // 断线 → 排队重连（首次约 2s）
-  await page.evaluate(() => window.__sockets[0].onclose({}));
+  await page.evaluate(`${L}[0].onclose({})`);
   const st = await page.evaluate(() => ({ status: window.__liq.status, hasTimer: !!window.__liq.timer, wait: window.__liq.nextRetryAt - Date.now(), retry: window.__liq.retry }));
   assert.equal(st.status, 'closed');
   assert.equal(st.hasTimer, true);
   assert.ok(st.wait > 1500 && st.wait <= 2600, '首次退避约 2s，实际 ' + st.wait);
   assert.equal(st.retry, 1);
-  await page.waitForFunction(() => window.__sockets.length === 2, null, { timeout: 6000 });
+  await page.waitForFunction(() => window.__sockets.filter((x) => /forceOrder/.test(x.url)).length === 2, null, { timeout: 6000 });
   // 再次失败：退避翻倍
-  await page.evaluate(() => { window.__sockets[1].onerror(); window.__sockets[1].onclose({}); });
+  await page.evaluate(`(function(){ var s = ${L}[1]; s.onerror(); s.onclose({}); })()`);
   const st2 = await page.evaluate(() => ({ wait: window.__liq.nextRetryAt - Date.now(), retry: window.__liq.retry, status: window.__liq.status }));
   assert.equal(st2.retry, 2);
   assert.ok(st2.wait > 3500 && st2.wait <= 4600, '第二次退避约 4s，实际 ' + st2.wait);
@@ -100,7 +102,60 @@ test('强平流：断线后指数退避自动重连；手动断开后不再重�
   await page.evaluate(() => window.liqDisconnect());
   assert.equal(await page.evaluate(() => ({ t: window.__liq.timer, s: window.__liq.status, m: window.__liq.manual })).then((x) => JSON.stringify(x)), JSON.stringify({ t: null, s: 'idle', m: true }));
   await page.waitForTimeout(4800);
-  assert.equal(await page.evaluate(() => window.__sockets.length), 2, '手动断开后不应再创建连接');
+  assert.equal(await page.evaluate(`${L}.length`), 2, '手动断开后不应再创建连接');
+});
+
+const RT = "window.__sockets.filter(function (s) { return /miniTicker/.test(s.url); })";
+
+test('实时推送：价格每秒更新，行情卡片刷新，预警秒级触发（并走远程推送）', { skip }, async () => {
+  const { page } = await open();
+  assert.equal(await page.evaluate(`${RT}.length`), 1, '启动后应建立行情推送连接');
+  assert.match(await page.evaluate(`${RT}[0].url`), /^wss:\/\/fstream\.binance\.com\/ws\/!miniTicker@arr$/);
+  await page.evaluate(`${RT}[0].onopen()`);
+  const px0 = await page.evaluate(() => allCoins.find((c) => c.symbol === 'ETHUSDT').price);
+  // 建一个「价格 ≥ 现价 +1%」的预警（此刻未满足 → 直接武装）
+  await page.click(`[onclick="showView('alerts')"], [data-onclick="showView('alerts')"]`);
+  await page.fill('#al_sym', 'ETHUSDT');
+  await page.selectOption('#al_kind', 'above');
+  await page.fill('#al_val', String(px0 * 1.01));
+  await page.click('button:has-text("添加预警")');
+  assert.equal(await page.evaluate(() => loadAlerts()[0].armed), true);
+  // 推送一个高于目标的价格
+  const px1 = px0 * 1.02;
+  await page.evaluate(`${RT}[0].onmessage({ data: JSON.stringify([{ s: 'ETHUSDT', c: '${px1}', o: '${px0}', h: '${px1}', l: '${px0}', q: '123456789' }]) })`);
+  await page.waitForFunction(() => loadAlerts()[0].triggeredAt > 0, null, { timeout: 4000 });
+  const info = await page.evaluate(() => ({
+    price: allCoins.find((c) => c.symbol === 'ETHUSDT').price,
+    pushed: window.__calls.some((c) => c[0] === 'electronAPI.pushSend' && /ETH/.test(JSON.stringify(c))),
+    hit: loadAlerts()[0].hitDetail
+  }));
+  assert.ok(Math.abs(info.price - px1) < 1e-9);
+  assert.equal(info.pushed, true, '预警应同时走远程推送通道');
+  assert.match(info.hit, /现价/);
+  // 推送健康时，30s 的全量轮询不再重复拉取
+  const before = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'getTickers').length);
+  assert.equal(before, 1);
+});
+
+test('创建时已满足的预警不会立刻触发，离开再进入才触发', { skip }, async () => {
+  const { page } = await open();
+  await page.evaluate(`${RT}[0].onopen()`);
+  const px = await page.evaluate(() => allCoins.find((c) => c.symbol === 'SOLUSDT').price);
+  await page.click(`[onclick="showView('alerts')"], [data-onclick="showView('alerts')"]`);
+  await page.fill('#al_sym', 'SOLUSDT');
+  await page.selectOption('#al_kind', 'above');
+  await page.fill('#al_val', String(px * 0.9));           // 现价已经高于目标
+  await page.click('button:has-text("添加预警")');
+  const a0 = await page.evaluate(() => loadAlerts()[0]);
+  assert.equal(a0.armed, false);
+  assert.equal(a0.triggeredAt, 0);
+  await page.evaluate(() => checkAlerts());
+  assert.equal(await page.evaluate(() => loadAlerts()[0].triggeredAt), 0, '一直满足时不触发');
+  const push = (p) => page.evaluate(`${RT}[0].onmessage({ data: JSON.stringify([{ s: 'SOLUSDT', c: '${p}', o: '${px}', q: '1' }]) })`);
+  await push(px * 0.8);                                     // 跌回目标之下 → 武装
+  await page.waitForFunction(() => loadAlerts()[0].armed === true, null, { timeout: 4000 });
+  await push(px * 1.0);                                     // 再次突破 → 触发
+  await page.waitForFunction(() => loadAlerts()[0].triggeredAt > 0, null, { timeout: 4000 });
 });
 
 test('完整回测 UI：跑回测、参数稳定性扫描、多币种组合回测', { skip }, async () => {

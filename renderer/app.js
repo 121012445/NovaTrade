@@ -165,9 +165,34 @@ async function loadAllCoins() {
     console.log("[app] loadAllCoins:", allCoins.length);
     const el = document.getElementById("coinCount");
     if (el) el.textContent = allCoins.length;
+    rtLastFullLoad = Date.now();
     return allCoins;
   } catch (e) { console.error("[app] loadAllCoins error:", e.message); return []; }
 }
+// ===== 实时推送（合约 !miniTicker@arr，见 lib/realtime.js）=====
+// 推送健康时：价格 / 24h 涨跌每秒更新，预警秒级判定，全量轮询放慢到 2 分钟一次；断线时自动恢复 30 秒轮询。
+var RT_URL = "wss://fstream.binance.com/ws/!miniTicker@arr";
+var rtIndex = {};
+var rtClient = null, rtDirty = false, rtLastFullLoad = 0;
+function rtHealthy() { return !!(rtClient && rtClient.healthy(10000)); }
+function startRealtime() {
+  if (rtClient || typeof createReconnectingWS !== "function") return;
+  rtClient = createReconnectingWS({
+    url: RT_URL, staleMs: 25000,
+    onMessage: function (raw) {
+      var msgs;
+      try { msgs = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (e) { return; }
+      if (Array.isArray(msgs) && applyMiniTickers(allCoins, allPrices, msgs, rtIndex) > 0) rtDirty = true;
+    },
+    onStatus: function () { try { klinePaintFresh(); } catch (e) {} }
+  });
+  rtClient.start();
+  // 合并后的 UI 刷新做节流：预警每秒判一次；行情卡片 / 侧栏每 3 秒刷新一次
+  appInterval(async function () { if (rtDirty) { rtDirty = false; try { checkAlerts(); } catch (e) {} } }, 1000);
+  appInterval(async function () { if (rtHealthy()) { try { renderMarket(currentFilter); renderSidebar(); } catch (e) {} } }, 3000);
+}
+window.startRealtime = startRealtime;
+window.rtHealthy = rtHealthy;
 async function fetchBTCAnalysis() {
   try {
     // 1009 性能优化：BTC 复用多周期缓存（analyzeMultiTimeframe 写 __mtfCache），
@@ -300,8 +325,9 @@ function klinePaintFresh() {
       new Date(st.at).toLocaleString() + "）";
   } else {
     el.className = "fresh-badge ok";
-    el.textContent = "实时";
-    el.title = "行情接口正常";
+    var pushing = (typeof rtHealthy === "function") && rtHealthy();
+    el.textContent = pushing ? "实时 · 推送" : "实时";
+    el.title = pushing ? "行情接口正常；WebSocket 推送已连接（价格每秒更新）" : "行情接口正常（轮询模式）";
   }
 }
 function klineMarkFresh() {
@@ -3284,7 +3310,14 @@ function setNotifyEnabled(on) {
 }
 function toggleNotify() { setNotifyEnabled(!notifyEnabled()); }
 // 统一出口：任何模块要发系统通知都走这里，避免各处重复判空 electronAPI
+function pushRemote(title, body) {
+  // 手机 / 群机器人等远程渠道：是否发送、发到哪里由主进程按用户配置决定（见 main/push.js）
+  try {
+    if (window.electronAPI && window.electronAPI.pushSend) window.electronAPI.pushSend({ title: title || "NovaTrade", body: String(body || "") });
+  } catch (e) { console.warn("[app] push failed:", e && e.message); }
+}
 function pushNotify(title, body) {
+  pushRemote(title, body);
   if (!notifyEnabled()) return false;
   // 前台且聚焦 ⇒ 用户正在看，跳过系统通知
   try {
@@ -3563,6 +3596,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (!window.binanceAPI) { console.error("[app] binanceAPI 未就绪"); const el = document.getElementById("coinCount"); if (el) el.textContent = "连接失败"; return; }
   try {
     await loadAllCoins(); checkLinkedFeatures();
+    startRealtime();
     updateStatus(true); renderMarket();
     renderSidebar();
     // 2026-10-09 第十批：预警徽标 / 托盘状态在首屏就同步一次
@@ -3575,7 +3609,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     try { window.__trendIQReady = true; if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol) selectTrendIQCoin("BTC"); } catch(e) { console.error("[app] TrendIQ init failed:", e); }
     // widget creation disabled at startup to fix main window handle
   } catch(e) { console.error("启动失败:", e); const el = document.getElementById("coinCount"); if (el) el.textContent = "连接失败"; }
-  appInterval(async () => { await loadAllCoins(); checkLinkedFeatures(); renderMarket(currentFilter); renderSidebar(); try { checkAlerts(); } catch(e) {} try { pushTrayStatus(); } catch(e) {} try { if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol && window.__trendIQCoins && window.__trendIQCoins.length > 0) selectTrendIQCoin(window.__trendIQCoins[0].symbol); } catch(e) {} }, 30000);
+  appInterval(async () => { if (!(rtHealthy() && Date.now() - rtLastFullLoad < 120000)) await loadAllCoins(); checkLinkedFeatures(); renderMarket(currentFilter); renderSidebar(); try { checkAlerts(); } catch(e) {} try { pushTrayStatus(); } catch(e) {} try { if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol && window.__trendIQCoins && window.__trendIQCoins.length > 0) selectTrendIQCoin(window.__trendIQCoins[0].symbol); } catch(e) {} }, 30000);
   appInterval(async () => {
     // 2026-10-10：先锁定币种再发请求。原来在 await 之后才读 selectedCoin，
     // 等待期间用户切币就会「新币名字 + 旧币数据」渲染 —— 这是「显示上一个缓存币种」的主因。
@@ -4354,8 +4388,7 @@ window.loadSizeCfg = loadSizeCfg;
 // 与「信号台账」里系统自动生成的跟踪提醒（alerts/tracks）完全独立：
 // 这里存的是用户手设的条件，键名不同、生命周期不同、互不影响。
 var ALERT_KEY = "novatrade_alerts_v1";
-var ALERT_KINDS = ["above", "below", "chgUp", "chgDown"];
-var ALERT_KIND_LABEL = { above: "价格 ≥", below: "价格 ≤", chgUp: "24h 涨幅 ≥", chgDown: "24h 跌幅 ≥" };
+// ALERT_KINDS / ALERT_KIND_LABEL 与判定逻辑（alertStep 等）在 lib/alerts-core.js
 function alertId() { return "a" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 function loadAlerts() {
   var a = null;
@@ -4383,7 +4416,19 @@ function alertUpdateBadge() {
 function alertCondText(a) {
   var v = ALERT_KIND_LABEL[a.kind] || "?";
   if (a.kind === "above" || a.kind === "below") return v + " " + formatPrice(a.value);
+  if (a.kind === "scoreAbove" || a.kind === "scoreBelow") return v + " " + a.value;
   return v + " " + Math.abs(a.value) + "%";
+}
+// 取一个币的判定上下文：现价 / 24h 涨跌 来自行情，评分来自最近一次多周期分析（15 分钟内才算有效）
+function alertCtxFor(symbol) {
+  var c = null;
+  try { c = (allCoins || []).find(function (x) { return x.symbol === symbol; }); } catch (e) {}
+  var ctx = { price: c ? c.price : NaN, change: c ? c.change : NaN, score: NaN };
+  try {
+    var m = (window.__mtfCache || {})[symbol];
+    if (m && m.data && Date.now() - m.ts < 15 * 60e3 && isFinite(m.data.score)) ctx.score = m.data.score;
+  } catch (e) {}
+  return c || isFinite(ctx.score) ? ctx : null;
 }
 function alertAdd() {
   var g = function (id) { var el = document.getElementById(id); return el ? String(el.value || "").trim() : ""; };
@@ -4395,19 +4440,29 @@ function alertAdd() {
   var val = parseFloat(g("al_val"));
   if (!isFinite(val) || val <= 0) { linkedToast("请填写大于 0 的目标值"); return; }
   if ((kind === "chgUp" || kind === "chgDown") && val > 100) { linkedToast("涨跌幅预警请填 0~100 之间的百分数"); return; }
+  if ((kind === "scoreAbove" || kind === "scoreBelow") && val > 100) { linkedToast("评分预警请填 0~100 之间的数"); return; }
+  var repEl = document.getElementById("al_repeat"), coolEl = document.getElementById("al_cool");
+  var repeat = !!(repEl && repEl.checked);
+  var cool = Math.min(1440, Math.max(1, Math.round(parseFloat(coolEl && coolEl.value) || 60)));
+  var item = { id: alertId(), symbol: sym, kind: kind, value: val, note: g("al_note").slice(0, 60), enabled: true, createdAt: Date.now(), triggeredAt: 0, repeat: repeat, cooldownMin: cool, fireCount: 0 };
+  // 穿越语义：创建时条件已经满足 → 先不武装，等价格离开满足区再回来才触发（不会刚设完就弹）
+  item.armed = alertInitialArmed(item, alertCtxFor(sym));
   var list = loadAlerts();
-  list.unshift({ id: alertId(), symbol: sym, kind: kind, value: val, note: g("al_note").slice(0, 60), enabled: true, createdAt: Date.now(), triggeredAt: 0 });
+  list.unshift(item);
   saveAlerts(list);
   renderAlerts();
-  linkedToast("已添加预警：" + splitSymbol(sym).base + " " + alertCondText({ kind: kind, value: val }));
-  checkAlerts();   // 立刻判一次，避免"刚设完就满足"却要等 30 秒
+  linkedToast("已添加预警：" + splitSymbol(sym).base + " " + alertCondText({ kind: kind, value: val }) +
+    (item.armed ? "" : "（当前已满足，离开该区间后再次进入时触发）"));
 }
 function alertToggle(id) {
   var list = loadAlerts();
   for (var i = 0; i < list.length; i++) {
     if (list[i].id === id) {
       list[i].enabled = !list[i].enabled;
-      if (list[i].enabled) list[i].triggeredAt = 0;   // 重新启用 = 重新武装
+      if (list[i].enabled) {   // 重新启用 = 重新武装；若此刻仍满足，则要等离开满足区后再触发
+        list[i].triggeredAt = 0; list[i].lastFiredAt = 0;
+        list[i].armed = alertInitialArmed(list[i], alertCtxFor(list[i].symbol));
+      }
       break;
     }
   }
@@ -4417,7 +4472,11 @@ function alertToggle(id) {
 function alertRearm(id) {
   var list = loadAlerts();
   for (var i = 0; i < list.length; i++) {
-    if (list[i].id === id) { list[i].enabled = true; list[i].triggeredAt = 0; list[i].hitDetail = ""; break; }
+    if (list[i].id === id) {
+      list[i].enabled = true; list[i].triggeredAt = 0; list[i].hitDetail = ""; list[i].lastFiredAt = 0;
+      list[i].armed = alertInitialArmed(list[i], alertCtxFor(list[i].symbol));
+      break;
+    }
   }
   saveAlerts(list);
   renderAlerts();
@@ -4453,37 +4512,21 @@ function alertUseCurrent() {
 function checkAlerts() {
   var list = loadAlerts();
   var now = Date.now();
-  var fired = [];
+  var fired = [], dirty = false;
   for (var i = 0; i < list.length; i++) {
     var a = list[i];
     if (!a.enabled || a.triggeredAt) continue;
-    var c = null;
-    try { c = (allCoins || []).find(function (x) { return x.symbol === a.symbol; }); } catch (e) {}
-    if (!c) continue;
-    var hit = false, detail = "";
-    if (a.kind === "above" && isFinite(c.price) && c.price >= a.value) {
-      hit = true; detail = "现价 " + formatPrice(c.price) + " ≥ " + formatPrice(a.value);
-    } else if (a.kind === "below" && isFinite(c.price) && c.price <= a.value) {
-      hit = true; detail = "现价 " + formatPrice(c.price) + " ≤ " + formatPrice(a.value);
-    } else if (a.kind === "chgUp" && isFinite(c.change) && c.change >= a.value) {
-      hit = true; detail = "24h " + (c.change >= 0 ? "+" : "") + c.change.toFixed(2) + "% ≥ " + a.value + "%";
-    } else if (a.kind === "chgDown" && isFinite(c.change) && c.change <= -Math.abs(a.value)) {
-      hit = true; detail = "24h " + c.change.toFixed(2) + "% ≤ -" + Math.abs(a.value) + "%";
-    }
-    if (hit) {
-      a.triggeredAt = now;
-      a.enabled = false;
-      a.hitDetail = detail;
-      fired.push({ a: a, detail: detail });
-    }
+    var r = alertStep(a, alertCtxFor(a.symbol), now, formatPrice);
+    if (Object.keys(r.next).length) { Object.assign(a, r.next); dirty = true; }
+    if (r.fire) fired.push({ a: a, detail: r.detail });
   }
+  if (dirty) saveAlerts(list);
   if (!fired.length) return 0;
-  saveAlerts(list);
   alertUpdateBadge();
   fired.forEach(function (f) {
     var base = splitSymbol(f.a.symbol).base;
     try { linkedToast(base + " 预警触发：" + f.detail); } catch (e) {}
-    try { pushNotify(base + " 价格预警触发", f.detail + (f.a.note ? " · " + f.a.note : "")); } catch (e) {}
+    try { pushNotify(base + (f.a.kind.indexOf("score") === 0 ? " 评分预警触发" : " 价格预警触发"), f.detail + (f.a.note ? " · " + f.a.note : "")); } catch (e) {}
   });
   try {
     var v = document.getElementById("view-alerts");
@@ -4508,9 +4551,13 @@ function renderAlerts() {
     '<option value="below">价格 ≤ 目标</option>' +
     '<option value="chgUp">24h 涨幅 ≥ %</option>' +
     '<option value="chgDown">24h 跌幅 ≥ %</option>' +
+    '<option value="scoreAbove">评分 ≥ （多周期分析）</option>' +
+    '<option value="scoreBelow">评分 ≤ （多周期分析）</option>' +
     '</select></label>' +
-    '<label>目标值<input type="number" step="any" id="al_val" placeholder="价格或百分数"></label>' +
+    '<label>目标值<input type="number" step="any" id="al_val" placeholder="价格、百分数或评分"></label>' +
     '<label>备注（可选）<input type="text" id="al_note" placeholder="例如：突破前高" style="min-width:170px"></label>' +
+    '<label class="nf-check"><input type="checkbox" id="al_repeat"><span>重复提醒</span></label>' +
+    '<label>冷却（分钟）<input type="number" min="1" max="1440" step="1" id="al_cool" value="60" style="min-width:80px"></label>' +
     '<button class="btn-primary" onclick="alertAdd()">添加预警</button>' +
     '</div>';
   var list = loadAlerts();
@@ -4529,7 +4576,10 @@ function renderAlerts() {
       return '<div class="' + cls + '">' +
         '<span class="alert-sym">' + escapeHtml(splitSymbol(a.symbol).base) + '</span>' +
         '<div style="flex:1"><div class="alert-cond">' + escapeHtml(alertCondText(a)) +
-        (a.note ? ' <span style="color:var(--text-muted)">· ' + escapeHtml(a.note) + '</span>' : '') + '</div>' + hitNote + '</div>' +
+        (a.note ? ' <span style="color:var(--text-muted)">· ' + escapeHtml(a.note) + '</span>' : '') +
+        (a.repeat ? ' <span style="color:var(--text-muted)">· 重复（冷却 ' + (a.cooldownMin || 60) + ' 分钟，已触发 ' + (a.fireCount || 0) + ' 次）</span>' : '') +
+        (a.armed === false && a.enabled && !a.triggeredAt ? ' <span style="color:var(--text-muted)">· 等待离开满足区后重新武装</span>' : '') +
+        '</div>' + hitNote + '</div>' +
         state +
         (a.triggeredAt ? '<button class="btn-ghost" onclick="alertRearm(\'' + a.id + '\')">重新武装</button>' : '') +
         '<button class="btn-ghost" onclick="alertToggle(\'' + a.id + '\')">' + (a.enabled ? "暂停" : "启用") + '</button>' +

@@ -19,7 +19,7 @@ function boot(routes, extra) {
   const electron = {
     app: {
       commandLine: { appendSwitch() {} }, setAppUserModelId() {}, requestSingleInstanceLock: () => true,
-      on(ev, fn) { events[ev] = fn; }, quit() {}, relaunch() {}, isPackaged: false,
+      on(ev, fn) { events[ev] = fn; }, quit() {}, relaunch() {}, isPackaged: false, getVersion: () => '1.2.0',
       getPath: () => userData,
       whenReady: () => new Promise(() => {})          // 不触发窗口 / 代理探测
     },
