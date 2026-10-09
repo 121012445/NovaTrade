@@ -53,6 +53,18 @@ bindStateAlias('__trendIQRendered', 'trendIQRendered');
 
 // 定时器句柄集中管理：可统一清理，避免重复初始化时任务叠加
 const appTimers = [];
+// 带重入保护的定时任务：上一轮还没跑完（网络慢、重试多）就跳过这一轮，而不是叠加请求。
+// 任务抛出的异常被吞掉并记录，不会让定时器停摆。
+function appInterval(fn, ms) {
+  let busy = false;
+  appTimers.push(setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try { await fn(); }
+    catch (e) { console.error("[app] interval task error:", e && e.message); }
+    finally { busy = false; }
+  }, ms));
+}
 function clearAppTimers() {
   while (appTimers.length) { try { clearInterval(appTimers.pop()); } catch (e) {} }
 }
@@ -214,8 +226,14 @@ function klineCachePrune(idx, now) {
   }
   return keep;
 }
+// 写缓存会同步 JSON.stringify 整份数据再写 localStorage，在主线程上做。10 秒一次的图表刷新不需要每次都写：
+// 同一个 key 在 KLINE_CACHE_MIN_GAP 内只写一次（缓存只用于断网兜底，晚几十秒无所谓）。
+const KLINE_CACHE_MIN_GAP = 30000;
+const __klinePutAt = {};
 function klineCachePut(key, rows) {
   const stamp = Date.now();
+  if (stamp - (__klinePutAt[key] || 0) < KLINE_CACHE_MIN_GAP) return true;
+  __klinePutAt[key] = stamp;
   const text = JSON.stringify({ ts: stamp, data: rows });
   try {
     localStorage.setItem(KLINE_CACHE_PREFIX + key, text);
@@ -3557,8 +3575,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     try { window.__trendIQReady = true; if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol) selectTrendIQCoin("BTC"); } catch(e) { console.error("[app] TrendIQ init failed:", e); }
     // widget creation disabled at startup to fix main window handle
   } catch(e) { console.error("启动失败:", e); const el = document.getElementById("coinCount"); if (el) el.textContent = "连接失败"; }
-  appTimers.push(setInterval(async () => { await loadAllCoins(); checkLinkedFeatures(); renderMarket(currentFilter); renderSidebar(); try { checkAlerts(); } catch(e) {} try { pushTrayStatus(); } catch(e) {} try { if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol && window.__trendIQCoins && window.__trendIQCoins.length > 0) selectTrendIQCoin(window.__trendIQCoins[0].symbol); } catch(e) {} }, 30000));
-  appTimers.push(setInterval(async () => {
+  appInterval(async () => { await loadAllCoins(); checkLinkedFeatures(); renderMarket(currentFilter); renderSidebar(); try { checkAlerts(); } catch(e) {} try { pushTrayStatus(); } catch(e) {} try { if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol && window.__trendIQCoins && window.__trendIQCoins.length > 0) selectTrendIQCoin(window.__trendIQCoins[0].symbol); } catch(e) {} }, 30000);
+  appInterval(async () => {
     // 2026-10-10：先锁定币种再发请求。原来在 await 之后才读 selectedCoin，
     // 等待期间用户切币就会「新币名字 + 旧币数据」渲染 —— 这是「显示上一个缓存币种」的主因。
     const reqSym = selectedCoin;
@@ -3569,16 +3587,16 @@ document.addEventListener("DOMContentLoaded", async () => {
       const [analysis, klines] = await Promise.all([analyzeMultiTimeframe(reqSym), fetchKlines(reqSym, interval, 150)]);
       if (analysis && klines.closes.length >= 30) renderAnalysis(reqSym, analysis, klines);
     } catch(e) { console.error("[app] analysis refresh error:", e.message); }
-  }, 10000));
-  appTimers.push(setInterval(async () => { await renderRecommendations(); notifyWidget(); }, 180000));
-  appTimers.push(setInterval(async () => { await resolveFwdSignals(); renderFwdStats(); }, 600000));
+  }, 10000);
+  appInterval(async () => { await renderRecommendations(); notifyWidget(); }, 180000);
+  appInterval(async () => { await resolveFwdSignals(); renderFwdStats(); }, 600000);
   // TrendIQ 分析面板每 2 分钟跟随多周期结论自动刷新（图不动，只刷新右侧分析）
   let trendiqAnalysisBusy = false;
-  appTimers.push(setInterval(async () => {
+  appInterval(async () => {
     if (!trendiqCurrentSymbol || trendiqAnalysisBusy || !document.getElementById("trendiqAIAnalysis")) return;
     trendiqAnalysisBusy = true;
     try { await loadTrendIQAnalysis(trendiqCurrentSymbol); } catch(e) {} finally { trendiqAnalysisBusy = false; }
-  }, 120000));
+  }, 120000);
   if (window.electronAPI && window.electronAPI.onWidgetCreated) {
     window.electronAPI.onWidgetCreated(() => { notifyWidget(); });
   }
@@ -5415,7 +5433,7 @@ function btFullResultHtml(res, cfg) {
   }
   html += '<div class="mini-title">以 R 为单位的净值曲线（' + trades.length + ' 笔）</div>' +
     '<div class="eq-chart">' + btEquitySvg(path, 600, 200) + '</div>' +
-    '<div class="size-note">纵轴是累计净 R（已扣双边手续费），虚线为 0 轴。曲线形状比终值更重要：<strong>是否长期横盘、是否靠最后几笔拉起来</strong>，这两点决定了策略能不能用。</div>';
+    '<div class="size-note">纵轴是累计净 R（已扣手续费、滑点、资金费率），虚线为 0 轴。曲线形状比终值更重要：<strong>是否长期横盘、是否靠最后几笔拉起来</strong>，这两点决定了策略能不能用。</div>';
   // 出场原因分布
   var reasonRows = Object.keys(st.byReason).map(function (k) {
     return '<tr><td>' + escapeHtml(k) + '</td><td>' + st.byReason[k] + '</td><td>' + (st.byReason[k] / st.n * 100).toFixed(1) + '%</td></tr>';

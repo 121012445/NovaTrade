@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <!-- 所有网络请求均通过 IPC 由主进程发起，渲染层无需任何外部连接权限 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src wss://fstream.binance.com; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src wss://fstream.binance.com; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>NovaTrade - AI 智能分析</title>
 <style>
 /* ============================================================
@@ -1214,6 +1214,7 @@ body {
   <script src="lib/analysis-core.js"></script>
   <script src="lib/scoring.js"></script>
   <script src="lib/backtest-core.js"></script>
+  <script src="lib/inline-handlers.js"></script>
   <script src="app.js"></script>
 
 </html>

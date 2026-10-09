@@ -1,9 +1,18 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, Notification, dialog, session } = require('electron');
 const path = require('path');
 
-app.commandLine.appendSwitch('disable-gpu');
-app.commandLine.appendSwitch('ignore-gpu-blacklist');
-app.commandLine.appendSwitch('use-gl', 'swiftshader');
+// GPU：默认启用硬件加速；只有显式要求或 GPU 进程连续崩溃时才降级为软件渲染（见 main/gpu-config.js）。
+// 这些开关必须在 app ready 之前设置。userData 路径在 ready 之前即可读取。
+const gpuCfg = require('./gpu-config');
+let GPU_CFG_FILE = null;
+try { GPU_CFG_FILE = path.join(app.getPath('userData'), 'gpu_config.json'); } catch (e) {}
+const GPU_CONFIG = GPU_CFG_FILE ? gpuCfg.read(GPU_CFG_FILE) : { softwareRendering: false, gpuCrashes: 0 };
+const SOFTWARE_RENDER = gpuCfg.shouldDisableGpu({ argv: process.argv, env: process.env, config: GPU_CONFIG });
+if (SOFTWARE_RENDER) {
+  app.commandLine.appendSwitch('disable-gpu');
+  app.commandLine.appendSwitch('ignore-gpu-blacklist');
+  app.commandLine.appendSwitch('use-gl', 'swiftshader');
+}
 
 // Windows 系统通知需要显式的 AppUserModelId，否则通知不显示或显示成 electron.app.*
 try { app.setAppUserModelId('NovaTrade'); } catch (e) {}
@@ -13,11 +22,44 @@ const https = require('https');
 const tls = require('tls');
 const fs = require('fs');
 
+const V = require('./validate');
+
+// 所有 IPC 入口先确认发送方是本应用加载的本地页面（file://）。
+// 即使渲染进程被导航到外部页面或被注入，也调不动主进程能力。
+function senderTrusted(e) {
+  try {
+    const u = (e.senderFrame && e.senderFrame.url) || (e.sender && e.sender.getURL && e.sender.getURL()) || '';
+    return u.startsWith('file://');
+  } catch (err) { return false; }
+}
+function ipcHandle(channel, fn) {
+  ipcMain.handle(channel, (e, ...args) => {
+    if (!senderTrusted(e)) { fileLog('ipc-denied', channel); return { __error: 'untrusted sender' }; }
+    return fn(e, ...args);
+  });
+}
+function ipcOn(channel, fn) {
+  ipcMain.on(channel, (e, ...args) => {
+    if (!senderTrusted(e)) { fileLog('ipc-denied', channel); return; }
+    fn(e, ...args);
+  });
+}
+
 const APP_ROOT = path.join(__dirname, '..');
 const RENDERER_PATH = path.join(APP_ROOT, 'renderer', 'index.html');
 const WIDGET_PATH = path.join(APP_ROOT, 'renderer', 'widget.html');
 const ICON_PATH = path.join(APP_ROOT, 'assets', 'tray.png');
 const PRELOAD_PATH = path.join(__dirname, 'preload.js');
+// 开发者工具：打包后的正式版默认关闭，需要时用 --devtools 或环境变量 NOVATRADE_DEVTOOLS=1 打开
+const DEVTOOLS_ENABLED = !app.isPackaged || process.argv.includes('--devtools') || process.env.NOVATRADE_DEVTOOLS === '1';
+const APP_FILE_URL = require('url').pathToFileURL(path.join(APP_ROOT, 'renderer')).href;
+
+// 页面加固：不允许新开窗口、不允许导航到应用目录之外、不允许 <webview>
+function hardenWebContents(wc) {
+  wc.setWindowOpenHandler(() => ({ action: 'deny' }));
+  wc.on('will-navigate', (e, url) => { if (!url.startsWith(APP_FILE_URL)) { e.preventDefault(); fileLog('nav-blocked', url); } });
+  wc.on('will-attach-webview', (e) => e.preventDefault());
+}
 const API_HOST = 'data-api.binance.vision';
 const FUTURES_API_HOST = 'fapi.binance.com';
 
@@ -286,14 +328,18 @@ function createWindow() {
     width: 1400, height: 1000, minWidth: 900, minHeight: 600,
     x: display.bounds.x + 100, y: display.bounds.y + 100,
     frame: false, backgroundColor: '#0a0a0f', show: true,
-    webPreferences: { nodeIntegration: false, contextIsolation: true, preload: PRELOAD_PATH, devTools: true }
+    // backgroundThrottling:false —— 窗口隐藏到托盘后，渲染进程里的轮询与价格预警仍按原频率运行
+    webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, preload: PRELOAD_PATH, devTools: DEVTOOLS_ENABLED, backgroundThrottling: false }
   });
+  hardenWebContents(mainWindow.webContents);
   log('[main] Window created');
   mainWindow.loadFile(RENDERER_PATH);
   // Create menu with DevTools option
   const menu = Menu.buildFromTemplate([
     { label: "查看", submenu: [
-      { label: "开发者工具", accelerator: "Ctrl+Shift+I", click: () => { mainWindow.webContents.openDevTools(); } },
+      ...(DEVTOOLS_ENABLED ? [{ label: "开发者工具", accelerator: "Ctrl+Shift+I", click: () => { mainWindow.webContents.openDevTools(); } }, { type: "separator" }] : []),
+      { label: "使用软件渲染（重启生效）", type: "checkbox", checked: SOFTWARE_RENDER,
+        click: (item) => { if (GPU_CFG_FILE) { gpuCfg.setSoftwareRendering(GPU_CFG_FILE, item.checked); app.isQuitting = true; app.relaunch(); app.quit(); } } },
       { type: "separator" },
       { label: "刷新", accelerator: "F5", click: () => { mainWindow.reload(); } },
       { label: "强制刷新", accelerator: "Ctrl+Shift+R", click: () => { mainWindow.webContents.reloadIgnoringCache(); } }
@@ -327,8 +373,9 @@ function createWidget() {
     width: 320, height: 200,
     x: primary.bounds.x + primary.bounds.width - 340, y: primary.bounds.y + 20,
     frame: false, transparent: true, alwaysOnTop: true, resizable: false,
-    webPreferences: { nodeIntegration: false, contextIsolation: true, preload: PRELOAD_PATH }
+    webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, preload: PRELOAD_PATH, devTools: DEVTOOLS_ENABLED, backgroundThrottling: false }
   });
+  hardenWebContents(widgetWindow.webContents);
   widgetWindow.loadFile(WIDGET_PATH);
   widgetWindow.webContents.on('console-message', (e, level, msg) => { log('[widget]', msg); });
   widgetWindow.webContents.on('did-finish-load', () => {
@@ -385,69 +432,75 @@ function createTray() {
   ]));
 }
 
-ipcMain.on('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
-ipcMain.on('window:maximize', () => { if (mainWindow) { if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize(); } });
-ipcMain.on('window:close', () => { if (mainWindow) mainWindow.close(); });
-ipcMain.on('window:show', () => { showMainWindow(); });
+ipcOn('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
+ipcOn('window:maximize', () => { if (mainWindow) { if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize(); } });
+ipcOn('window:close', () => { if (mainWindow) mainWindow.close(); });
+ipcOn('window:show', () => { showMainWindow(); });
 // ===== 托盘状态：把当前关注币的涨跌写进托盘 tooltip（纯只读展示）=====
-ipcMain.handle('tray:status', (e, text) => {
+ipcHandle('tray:status', (e, text) => {
   try {
     if (!tray) return false;
-    tray.setToolTip(String(text || 'NovaTrade - 单击显示主窗口'));
+    tray.setToolTip(V.str(text || 'NovaTrade - 单击显示主窗口', 200));
     return true;
   } catch (err) { return false; }
 });
-ipcMain.handle('widget:create', () => { createWidget(); return true; });
-ipcMain.on('devtools:open', () => {
-  if (mainWindow) mainWindow.webContents.openDevTools();
+ipcHandle('widget:create', () => { createWidget(); return true; });
+ipcOn('devtools:open', () => {
+  if (DEVTOOLS_ENABLED && mainWindow) mainWindow.webContents.openDevTools();
 });
-ipcMain.on('widget:update', (e, data) => { lastWidgetData = data; if (widgetWindow) widgetWindow.webContents.send('widget:data', data); });
-ipcMain.on('renderer:refresh', () => { if (mainWindow) mainWindow.webContents.reload(); });
+ipcOn('widget:update', (e, data) => {
+  // 小组件数据必须是不太大的普通对象
+  if (!data || typeof data !== 'object') return;
+  try { if (JSON.stringify(data).length > 200000) return; } catch (err) { return; }
+  lastWidgetData = data;
+  if (widgetWindow) widgetWindow.webContents.send('widget:data', data);
+});
+ipcOn('renderer:refresh', () => { if (mainWindow) mainWindow.webContents.reload(); });
 
 // ===== 悬浮窗控制（preload 已暴露，此前主进程缺失导致按钮无效）=====
-ipcMain.on('widget:close', () => {
+ipcOn('widget:close', () => {
   if (widgetWindow) { widgetWindow.close(); }
 });
 // 注意：preload 传入的是内容尺寸（240x320 / 260x520），需换算为窗口尺寸（含 .wb 的 8px 外边距 + 头部）
-ipcMain.on('widget:resize', (e, w, h) => {
+ipcOn('widget:resize', (e, w, h) => {
   if (!widgetWindow) return;
-  const width = Math.max(200, Math.round((w || 240) + 16));
-  const height = Math.max(120, Math.round((h || 320) + 16));
+  const width = V.int((Number(w) || 240) + 16, 200, 1200, 256);
+  const height = V.int((Number(h) || 320) + 16, 120, 1600, 336);
   widgetWindow.setContentSize(width, height);
   log('[main] widget resized to', width + 'x' + height);
 });
-ipcMain.on('widget:alwaysOnTop', (e, enabled) => {
+ipcOn('widget:alwaysOnTop', (e, enabled) => {
   if (!widgetWindow) return;
   widgetWindow.setAlwaysOnTop(!!enabled);
   if (enabled) widgetWindow.setVisibleOnAllWorkspaces(true);
   log('[main] widget alwaysOnTop =', !!enabled);
 });
 // 渲染层通用消息通道（此前无接收方，仅落日志便于排查）
-ipcMain.on('renderer-msg', (e, msg) => { log('[main] renderer-msg:', msg); });
+ipcOn('renderer-msg', (e, msg) => { log('[main] renderer-msg:', V.str(msg, 500)); });
 
-ipcMain.handle('futures:setProxy', async (e, proxy) => {
+ipcHandle('futures:setProxy', async (e, proxy) => {
   // 渲染层传来的值不可信：只接受空字符串（直连）或 http/https/socks 代理地址
-  if (proxy && (typeof proxy !== 'string' || !proxyRulesFor(proxy))) return false;
+  if (V.proxyUrl(proxy) === null) return false;
   futuresProxy = proxy || '';
   log('[main] futures proxy set:', proxy || 'none');
   saveProxyConfig();
   await applySessionProxy();
   return true;
 });
-ipcMain.handle('futures:getProxy', () => futuresProxy);
-ipcMain.handle('spot:setProxy', async (e, proxy) => {
+ipcHandle('futures:getProxy', () => futuresProxy);
+ipcHandle('spot:setProxy', async (e, proxy) => {
   // 渲染层传来的值不可信：只接受空字符串（直连）或 http/https/socks 代理地址
-  if (proxy && (typeof proxy !== 'string' || !proxyRulesFor(proxy))) return false;
+  if (V.proxyUrl(proxy) === null) return false;
   spotProxy = proxy || '';
   log('[main] spot proxy set:', proxy || 'none');
   saveProxyConfig();
   await applySessionProxy();
   return true;
 });
-ipcMain.handle('spot:getProxy', () => spotProxy);
+ipcHandle('spot:getProxy', () => spotProxy);
 // 代理状态查询 / 重新检测（供渲染层显示提示与手动重试）
-ipcMain.handle('proxy:getStatus', () => proxyStatus);
-ipcMain.handle('proxy:redetect', async () => {
+ipcHandle('proxy:getStatus', () => proxyStatus);
+ipcHandle('proxy:redetect', async () => {
   const detected = await detectProxy();
   spotProxy = detected || '';
   futuresProxy = detected || '';
@@ -461,30 +514,54 @@ ipcMain.handle('proxy:redetect', async () => {
   log('[main] proxy redetect:', proxyStatus.mode, detected || '(direct)', ok ? 'OK' : 'FAIL');
   return proxyStatus;
 });
-ipcMain.handle('proxy:verify', async () => {
+ipcHandle('proxy:verify', async () => {
   const candidate = spotProxy || futuresProxy;
   const ok = candidate ? await verifyProxy(candidate) : false;
   proxyStatus = { ...proxyStatus, checkedAt: Date.now(), error: ok ? '' : (candidate ? '代理无法访问币安，请检查代理是否开启' : '直连无法访问币安，请开启代理或在设置中配置') };
   return { ok, status: proxyStatus };
 });
-ipcMain.handle('binance:getTickers', async () => { try { return await binanceRequest('/api/v3/ticker/24hr'); } catch(e) { log('[main] getTickers error:', e.message); return { __error: e.message }; } });
-ipcMain.handle('binance:getFuturesTickers', async () => { try { return await binanceFuturesRequest('/fapi/v1/ticker/24hr'); } catch(e) { log('[main] getFuturesTickers error:', e.message); return { __error: e.message }; } });
-ipcMain.handle('binance:getFuturesPrice', async (e, sym) => { try { const r = await binanceFuturesRequest('/fapi/v1/ticker/price?symbol=' + encodeURIComponent(sym)); return r; } catch(e) { log('[main] getFuturesPrice error:', e.message); return { __error: e.message, price: '0' }; } });
-ipcMain.handle('binance:getFuturesKlines', async (e, sym, interval, limit) => { try { return await binanceFuturesRequest('/fapi/v1/klines?symbol=' + encodeURIComponent(sym) + '&interval=' + interval + '&limit=' + (limit||100)); } catch(e) { log('[main] getFuturesKlines error:', e.message); return { __error: e.message }; } });
-ipcMain.handle('binance:getFuturesSymbols', async () => { try { return await binanceFuturesRequest('/fapi/v1/exchangeInfo'); } catch(e) { log('[main] getFuturesSymbols error:', e.message); return { __error: e.message, symbols: [] }; } });
-ipcMain.handle('binance:getPrice', async (e, sym) => { try { const r = await binanceRequest('/api/v3/ticker/price?symbol=' + encodeURIComponent(sym)); return r; } catch(e) { log('[main] getPrice error:', e.message); return { __error: e.message, price: '0' }; } });
-ipcMain.handle('binance:get24hrTicker', async (e, sym) => { try { return await binanceRequest('/api/v3/ticker/24hr?symbol=' + encodeURIComponent(sym)); } catch(e) { log('[main] get24hrTicker error:', e.message); return { __error: e.message }; } });
-ipcMain.handle('binance:getExchangeInfo', async () => { try { return await binanceRequest('/api/v3/exchangeInfo'); } catch(e) { log('[main] getExchangeInfo error:', e.message); return { __error: e.message, symbols: [] }; } });
-ipcMain.handle('binance:getKlines', async (e, sym, interval, limit, startTime) => {
-  const lim = limit || 100;
-  const st = startTime ? '&startTime=' + Math.floor(startTime) : '';
+const bad = (what, extra) => Object.assign({ __error: 'invalid ' + what }, extra || {});
+// 统一的"出错返回 { __error }"包装，渲染层按 __error 字段判断失败
+function safe(tag, fn, extra) {
+  return async (e, ...args) => {
+    try { return await fn(...args); }
+    catch (err) { log('[main] ' + tag + ' error:', err.message); return Object.assign({ __error: err.message }, extra || {}); }
+  };
+}
+ipcHandle('binance:getTickers', safe('getTickers', () => binanceRequest('/api/v3/ticker/24hr')));
+ipcHandle('binance:getFuturesTickers', safe('getFuturesTickers', () => binanceFuturesRequest('/fapi/v1/ticker/24hr')));
+ipcHandle('binance:getFuturesPrice', safe('getFuturesPrice', async (symRaw) => {
+  const sym = V.symbol(symRaw); if (!sym) return bad('symbol', { price: '0' });
+  return binanceFuturesRequest('/fapi/v1/ticker/price?symbol=' + sym);
+}, { price: '0' }));
+ipcHandle('binance:getFuturesKlines', safe('getFuturesKlines', async (symRaw, ivRaw, limit) => {
+  const sym = V.symbol(symRaw), iv = V.interval(ivRaw);
+  if (!sym) return bad('symbol'); if (!iv) return bad('interval');
+  return binanceFuturesRequest('/fapi/v1/klines?symbol=' + sym + '&interval=' + iv + '&limit=' + V.int(limit, 1, 1500, 100));
+}));
+ipcHandle('binance:getFuturesSymbols', safe('getFuturesSymbols', () => binanceFuturesRequest('/fapi/v1/exchangeInfo'), { symbols: [] }));
+ipcHandle('binance:getPrice', safe('getPrice', async (symRaw) => {
+  const sym = V.symbol(symRaw); if (!sym) return bad('symbol', { price: '0' });
+  return binanceRequest('/api/v3/ticker/price?symbol=' + sym);
+}, { price: '0' }));
+ipcHandle('binance:get24hrTicker', safe('get24hrTicker', async (symRaw) => {
+  const sym = V.symbol(symRaw); if (!sym) return bad('symbol');
+  return binanceRequest('/api/v3/ticker/24hr?symbol=' + sym);
+}));
+ipcHandle('binance:getExchangeInfo', safe('getExchangeInfo', () => binanceRequest('/api/v3/exchangeInfo'), { symbols: [] }));
+ipcHandle('binance:getKlines', async (e, symRaw, ivRaw, limitRaw, startRaw) => {
+  const sym = V.symbol(symRaw), iv = V.interval(ivRaw);
+  if (!sym) return bad('symbol'); if (!iv) return bad('interval');
+  const lim = V.int(limitRaw, 1, 1500, 100);
+  const stMs = V.timestamp(startRaw);
+  const st = stMs ? '&startTime=' + stMs : '';
   // 合约优先；合约不可用（无该永续合约 -1121 / 限流 / 网络）时回退现货。
   // 现货 klines 单次上限 1000，合约上限 1500，回退时需要收敛 limit。
-  try { return await binanceFuturesRequest('/fapi/v1/klines?symbol=' + encodeURIComponent(sym) + '&interval=' + interval + '&limit=' + lim + st); }
-  catch(e) {
-    log('[main] getKlines futures fail, try spot:', e.message);
-    try { return await binanceKlinesRequest('/api/v3/klines?symbol=' + encodeURIComponent(sym) + '&interval=' + interval + '&limit=' + Math.min(lim, 1000) + st); }
-    catch(e2) { log('[main] getKlines spot fail:', e2.message); return { __error: e2.message }; }
+  try { return await binanceFuturesRequest('/fapi/v1/klines?symbol=' + sym + '&interval=' + iv + '&limit=' + lim + st); }
+  catch(err) {
+    log('[main] getKlines futures fail, try spot:', err.message);
+    try { return await binanceKlinesRequest('/api/v3/klines?symbol=' + sym + '&interval=' + iv + '&limit=' + Math.min(lim, 1000) + st); }
+    catch(err2) { log('[main] getKlines spot fail:', err2.message); return { __error: err2.message }; }
   }
 });
 
@@ -496,7 +573,7 @@ function readFwdFile(f) {
   if (!Array.isArray(arr)) throw new Error('not an array');
   return arr;
 }
-ipcMain.handle('fwd:load', () => {
+ipcHandle('fwd:load', () => {
   const f = fwdFile();
   if (!fs.existsSync(f)) return [];
   try { return readFwdFile(f); }
@@ -516,7 +593,7 @@ function fwdWriteAtomic(json) {
     .then(() => fs.promises.copyFile(f, f + '.bak').catch(() => {}))   // 首次保存没有旧文件，忽略
     .then(() => fs.promises.rename(tmp, f));
 }
-ipcMain.handle('fwd:save', (e, data) => {
+ipcHandle('fwd:save', (e, data) => {
   // 渲染层传来的数据不可信：必须是不太大的对象数组
   if (!Array.isArray(data) || data.length > FWD_MAX_RECORDS || !data.every((r) => r && typeof r === 'object' && !Array.isArray(r))) {
     fileLog('fwd-save', 'rejected invalid payload');
@@ -536,14 +613,14 @@ async function derivOne(urlPath) {
   try { const r = await binanceFuturesRequest(urlPath); if (r && r.__error) return { __error: r.__error }; return r; }
   catch (e) { return { __error: e.message }; }
 }
-ipcMain.handle('deriv:snapshot', async (e, symRaw, period, limit) => {
-  const sym = String(symRaw || '').toUpperCase();
-  if (!sym) return { __error: 'empty symbol' };
-  const p = period || '1h';
-  const n = Math.min(Math.max(parseInt(limit, 10) || 24, 2), 500);
-  const q = 'symbol=' + encodeURIComponent(sym) + '&period=' + encodeURIComponent(p) + '&limit=' + n;
+ipcHandle('deriv:snapshot', async (e, symRaw, periodRaw, limit) => {
+  const sym = V.symbol(symRaw);
+  if (!sym) return bad('symbol');
+  const p = V.period(periodRaw) || '1h';
+  const n = V.int(limit, 2, 500, 24);
+  const q = 'symbol=' + sym + '&period=' + p + '&limit=' + n;
   const [premium, oi, lsAccount, lsTop, taker] = await Promise.all([
-    derivOne('/fapi/v1/premiumIndex?symbol=' + encodeURIComponent(sym)),
+    derivOne('/fapi/v1/premiumIndex?symbol=' + sym),
     derivOne('/futures/data/openInterestHist?' + q),
     derivOne('/futures/data/globalLongShortAccountRatio?' + q),
     derivOne('/futures/data/topLongShortPositionRatio?' + q),
@@ -563,38 +640,41 @@ function genericJsonRequest(host, urlPath, proxyUrl, timeoutMs) {
   });
 }
 // ① 恐惧贪婪指数（alternative.me，免费无 key，与币安评分体系完全独立）
-ipcMain.handle('alt:fng', async (e, limit) => {
-  const n = Math.min(Math.max(parseInt(limit, 10) || 30, 1), 200);
+ipcHandle('alt:fng', async (e, limit) => {
+  const n = V.int(limit, 1, 200, 30);
   try { return await genericJsonRequest('api.alternative.me', '/fng/?limit=' + n, futuresProxy || spotProxy, 10000); }
   catch (err) { log('[main] fng error:', err.message); return { __error: err.message }; }
 });
 // ② 订单簿深度（只读盘口快照，用于观察买卖墙；不提供任何下单入口）
-ipcMain.handle('binance:futuresDepth', async (e, symRaw, limit) => {
-  const sym = String(symRaw || '').toUpperCase();
-  if (!sym) return { __error: 'empty symbol' };
-  const n = Math.min(Math.max(parseInt(limit, 10) || 500, 5), 1000);
-  try { return await binanceFuturesRequest('/fapi/v1/depth?symbol=' + encodeURIComponent(sym) + '&limit=' + n); }
+// 币安 depth 只接受固定档位的 limit，其余值会被拒绝
+const DEPTH_LIMITS = [5, 10, 20, 50, 100, 500, 1000];
+ipcHandle('binance:futuresDepth', async (e, symRaw, limit) => {
+  const sym = V.symbol(symRaw);
+  if (!sym) return bad('symbol');
+  const want = V.int(limit, 5, 1000, 500);
+  const n = DEPTH_LIMITS.find((x) => x >= want) || 1000;
+  try { return await binanceFuturesRequest('/fapi/v1/depth?symbol=' + sym + '&limit=' + n); }
   catch (err) { log('[main] depth error:', err.message); return { __error: err.message }; }
 });
 // ③ 逐笔聚合成交（用于筛大额单；只读）
-ipcMain.handle('binance:aggTrades', async (e, symRaw, limit) => {
-  const sym = String(symRaw || '').toUpperCase();
-  if (!sym) return { __error: 'empty symbol' };
-  const n = Math.min(Math.max(parseInt(limit, 10) || 500, 10), 1000);
-  try { return await binanceFuturesRequest('/fapi/v1/aggTrades?symbol=' + encodeURIComponent(sym) + '&limit=' + n); }
+ipcHandle('binance:aggTrades', async (e, symRaw, limit) => {
+  const sym = V.symbol(symRaw);
+  if (!sym) return bad('symbol');
+  const n = V.int(limit, 10, 1000, 500);
+  try { return await binanceFuturesRequest('/fapi/v1/aggTrades?symbol=' + sym + '&limit=' + n); }
   catch (err) { log('[main] aggTrades error:', err.message); return { __error: err.message }; }
 });
 
 // ===== 系统通知（价格提醒 / 模拟跟踪触发时，窗口可能在托盘里）=====
-ipcMain.handle('notify:show', (e, payload) => {
+ipcHandle('notify:show', (e, payload) => {
   try {
     if (!Notification.isSupported()) return false;
-    const o = payload || {};
+    const o = (payload && typeof payload === 'object') ? payload : {};
     const n = new Notification({
-      title: String(o.title || 'NovaTrade'),
-      body: String(o.body || ''),
+      title: V.str(o.title || 'NovaTrade', 100),
+      body: V.str(o.body, 500),
       silent: !!o.silent,
-      urgency: o.urgency || 'normal'
+      urgency: ['low', 'normal', 'critical'].includes(o.urgency) ? o.urgency : 'normal'
     });
     // 点通知 → 把主窗口唤到前台
     n.on('click', () => { try { showMainWindow(); } catch (err) {} });
@@ -631,8 +711,15 @@ function saveWithDialog(kind, defaultName, dataOrBase64, encoding) {
     } catch (err) { resolve({ ok: false, error: err.message }); }
   });
 }
-ipcMain.handle('file:exportCsv', (e, defaultName, text) => saveWithDialog('csv', defaultName || 'novatrade.csv', text));
-ipcMain.handle('file:exportPng', (e, defaultName, dataUrl) => saveWithDialog('png', defaultName || 'novatrade.png', dataUrl));
+const EXPORT_MAX_CHARS = 60 * 1024 * 1024;
+ipcHandle('file:exportCsv', (e, defaultName, text) => {
+  if (typeof text !== 'string' || text.length > EXPORT_MAX_CHARS) return { ok: false, error: 'invalid or too large payload' };
+  return saveWithDialog('csv', V.fileName(defaultName, 'novatrade.csv'), text);
+});
+ipcHandle('file:exportPng', (e, defaultName, dataUrl) => {
+  if (typeof dataUrl !== 'string' || dataUrl.length > EXPORT_MAX_CHARS || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) return { ok: false, error: 'invalid or too large payload' };
+  return saveWithDialog('png', V.fileName(defaultName, 'novatrade.png'), dataUrl);
+});
 
 // ===== 单实例限制：同一时间只允许运行一个 NovaTrade =====
 // Electron 的单实例锁以 userData 目录为键；本项目源码运行版与安装版 package.json 的
@@ -664,7 +751,14 @@ app.whenReady().then(async () => {
   // 保证渲染层首次请求就带上正确的代理设置，避免启动瞬间请求全部失败
   try { await initProxy(); } catch (e) { fileLog('proxy-init-fail', e.message); }
   await applySessionProxy();
+  // 渲染页不需要任何浏览器权限（通知走主进程的 Notification）：一律拒绝
+  try {
+    session.defaultSession.setPermissionRequestHandler((wc, perm, cb) => cb(false));
+    session.defaultSession.setPermissionCheckHandler(() => false);
+  } catch (e) { fileLog('permission-handler', e.message); }
   createWindow();
+  // 正常启动完成一段时间后清零 GPU 崩溃计数（崩溃要「连续」才算）
+  setTimeout(() => { if (GPU_CFG_FILE) gpuCfg.clearCrashes(GPU_CFG_FILE); }, 60000);
   // 页面加载完成后把代理状态推给渲染层（用于显示"代理未开启"提示）
   if (mainWindow) {
     mainWindow.webContents.on('did-finish-load', () => {
@@ -680,6 +774,15 @@ app.on('window-all-closed', () => {
   // 不设置 mainWindow = null，保留引用供托盘唤起；非 darwin 平台也不退出
 });
 app.on('activate', () => { showMainWindow(); });
+// GPU 进程异常退出：累计到阈值后自动切到软件渲染并重启一次，避免用户面对黑屏 / 反复崩溃
+app.on('child-process-gone', (e, details) => {
+  try {
+    if (!details || details.type !== 'GPU' || details.reason === 'clean-exit' || !GPU_CFG_FILE || SOFTWARE_RENDER) return;
+    fileLog('gpu-gone', JSON.stringify(details));
+    const r = gpuCfg.recordGpuCrash(GPU_CFG_FILE);
+    if (r.switched) { fileLog('gpu-fallback', 'switching to software rendering and relaunching'); app.isQuitting = true; app.relaunch(); app.quit(); }
+  } catch (err) { fileLog('gpu-gone-handler', err.message); }
+});
 
 
 
