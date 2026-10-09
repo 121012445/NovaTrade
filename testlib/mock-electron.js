@@ -27,6 +27,7 @@ function boot(routes, extra) {
     Notification: Object.assign(function () {}, { isSupported: () => false }),
     dialog: e.dialog || {}, screen: {},
     safeStorage: e.safeStorage || { isEncryptionAvailable: () => false },
+    shell: { openExternal(u) { (electron.__opened = electron.__opened || []).push(u); } },
     session: { defaultSession: { setProxy: async (c) => { sessionCalls.push(c); }, setPermissionRequestHandler() {}, setPermissionCheckHandler() {} } },
     ipcMain: { handle: (n, f) => { handlers[n] = f; }, on: (n, f) => { listeners[n] = f; } }
   };

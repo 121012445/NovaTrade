@@ -29,6 +29,7 @@
       "main/*.js",
       "renderer/index.html",
       "renderer/app.js",
+      "renderer/settings.js",
       "renderer/lib/*.js",
       "renderer/widget.html",
       "renderer/widget.js",

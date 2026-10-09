@@ -184,3 +184,123 @@ test('完整回测 UI：跑回测、参数稳定性扫描、多币种组合回�
   assert.deepEqual(await page.evaluate(() => window.__csp), []);
   assert.deepEqual(errors.filter((e) => !/Failed to load resource/.test(e)), []);
 });
+
+test('设置页：添加推送渠道并保存（凭据只回显尾号）、测试按钮、扫描范围与新信号提醒开关', { skip }, async () => {
+  const { page, errors } = await open();
+  await page.click(`[onclick="showView('settings')"], [data-onclick="showView('settings')"]`);
+  await page.waitForSelector('#pushNewType');
+  await page.selectOption('#pushNewType', 'telegram');
+  await page.click('button:has-text("添加")');
+  await page.fill('.set-ch [data-f="botToken"]', '123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abc-123');
+  await page.fill('.set-ch [data-f="chatId"]', '-100123');
+  await page.click('button:has-text("保存推送设置")');
+  await page.waitForFunction(() => /已保存/.test(document.getElementById('pushMsg').textContent));
+  const shown = await page.inputValue('.set-ch [data-f="botToken"]');
+  assert.equal(shown, '••••-123', '保存后只回显尾号');
+  assert.ok(!(await page.content()).includes('ABCDEFGHIJKLMNOPQRSTUVWXYZ'));
+  await page.click('.set-ch button:has-text("测试")');
+  await page.waitForFunction(() => /测试消息已发送/.test(document.getElementById('pushMsg').textContent));
+  // 用打码值再次保存：不会把占位符当成新令牌（主进程保留原值）
+  const sent = await page.evaluate(() => window.__calls.filter((c) => c[0] === 'pushSetConfig').pop()[1].channels[0].botToken);
+  assert.equal(sent, '••••-123');
+  // 扫描范围与新信号提醒
+  await page.selectOption('.set-card select[onchange], .set-card select[data-onchange]', '40');
+  assert.equal(await page.evaluate(() => scanSize()), 40);
+  await page.check('.set-card input[type=checkbox][onchange], .set-card input[type=checkbox][data-onchange]');
+  assert.equal(await page.evaluate(() => signalNotifyEnabled()), true);
+  // 删除渠道
+  await page.click('.set-ch button:has-text("删除")');
+  await page.waitForFunction(() => document.querySelectorAll('#pushChannels .set-ch').length === 0);
+  assert.deepEqual(errors, []);
+});
+
+test('AI 解读：未配置给出提示；配置后生成解读，面板每 10 秒重绘后结果仍在；发给模型的摘要不含密钥', { skip }, async () => {
+  const { page } = await open();
+  await page.click(`[onclick="showView('analysis')"], [data-onclick="showView('analysis')"]`);
+  await page.waitForSelector('#aiExplainBox button', { timeout: 15000 });
+  await page.click('#aiExplainBox button');
+  await page.waitForFunction(() => /尚未配置/.test(document.getElementById('aiExplainBox').textContent));
+  // 去设置页配置
+  await page.click(`[onclick="showView('settings')"], [data-onclick="showView('settings')"]`);
+  await page.fill('#llm_baseUrl', 'https://api.example.com/v1');
+  await page.fill('#llm_model', 'gpt-4o-mini');
+  await page.fill('#llm_key', 'sk-secret-1234567890');
+  await page.click('[onclick="llmSave()"], [data-onclick="llmSave()"]');
+  await page.waitForFunction(() => /已保存/.test(document.getElementById('llmMsg').textContent));
+  assert.equal(await page.inputValue('#llm_key'), '••••7890');
+  await page.click(`[onclick="showView('analysis')"], [data-onclick="showView('analysis')"]`);
+  await page.waitForSelector('#aiExplainBox button');
+  await page.click('#aiExplainBox button');
+  await page.waitForFunction(() => /结构偏多/.test(document.getElementById('aiExplainBox').textContent), null, { timeout: 8000 });
+  assert.match(await page.locator('#aiExplainBox').innerText(), /不构成投资建议/);
+  const payload = await page.evaluate(() => window.__lastLlmPayload);
+  assert.ok(payload.symbol && Array.isArray(payload.signals) && payload.signals.length > 0 && payload.forwardValidation);
+  assert.ok(!JSON.stringify(payload).includes('sk-secret'));
+  // 分析面板整体重绘（切币再切回、或定时刷新）后，解读结果仍在
+  await page.evaluate(() => { const d = window.__lastAnalysisData; renderAnalysis(d.symbol, d.a, d.klines); });
+  assert.match(await page.locator('#aiExplainBox').innerText(), /结构偏多/);
+});
+
+test('AI 推荐卡片显示相对强度 / 衍生品倾向；前向验证记录带上特征向量用于影子模型', { skip }, async () => {
+  const { page } = await open();
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => document.querySelectorAll('.recommend-card .rc-chip').length > 0, null, { timeout: 30000 });
+  const chips = await page.locator('.recommend-card .rc-chip').allInnerTexts();
+  assert.ok(chips.some((t) => /相对BTC/.test(t)), JSON.stringify(chips));
+  assert.ok(chips.some((t) => /衍生品/.test(t)), JSON.stringify(chips));
+  const recs = await page.evaluate(() => (window.__fwdStore || []).filter((r) => r.feat));
+  assert.ok(recs.length > 0, '前向验证记录应带 feat');
+  assert.equal(recs[0].feat.length, 12);
+  assert.ok(recs.every((r) => r.feat.every((v) => typeof v === 'number' && isFinite(v))));
+  assert.ok(recs.some((r) => typeof r.dv === 'number'), '至少有一条记录带衍生品倾向');
+  // 影子模型样本不足时不显示概率，只在前向验证栏提示未就绪
+  assert.ok(!chips.some((t) => /影子模型/.test(t)));
+  assert.match(await page.locator('#fwdStats').innerText(), /影子模型/);
+});
+
+test('备份：导出只含 novatrade 数据且排除缓存；导入后写回并重新加载', { skip }, async () => {
+  const { page } = await open();
+  await page.evaluate(() => { localStorage.setItem('novatrade_alerts_v1', '[{"id":"x"}]'); localStorage.setItem('other_app_key', 'nope'); });
+  await page.click(`[onclick="showView('settings')"], [data-onclick="showView('settings')"]`);
+  await page.click('button:has-text("导出备份")');
+  await page.waitForFunction(() => window.__saved.length === 1);
+  const pack = JSON.parse(await page.evaluate(() => window.__saved[0].json));
+  assert.equal(pack.kind, 'novatrade-backup');
+  assert.equal(pack.local['novatrade_alerts_v1'], '[{"id":"x"}]');
+  assert.ok(!('other_app_key' in pack.local), '其它应用的键不应被备份');
+  assert.ok(!Object.keys(pack.local).some((k) => /kline_v1::|kline_idx|recommend-snapshot|shadow_v1/.test(k)), '缓存类数据不应被备份');
+  // 导入：伪造的备份里夹带非白名单键与非字符串值，应被忽略
+  page.on('dialog', (d) => d.accept());
+  await page.evaluate(() => { window.__importData = { kind: 'novatrade-backup', version: 1, local: { 'novatrade_notify': '0', 'evil_key': 'x', 'novatrade_kline_idx_v1': 'junk', 'novatrade_density': 5 }, fwd: [] }; });
+  await Promise.all([page.waitForEvent('load'), page.click('button:has-text("导入备份")')]);
+  assert.equal(await page.evaluate(() => localStorage.getItem('novatrade_notify')), '0');
+  assert.equal(await page.evaluate(() => localStorage.getItem('evil_key')), null);
+  assert.notEqual(await page.evaluate(() => localStorage.getItem('novatrade_kline_idx_v1')), 'junk');
+});
+
+test('币安不可达时界面标明「备用数据源 · OKX」', { skip }, async () => {
+  const { page } = await open();
+  await page.evaluate(() => { window.__dataSourceMock = { name: 'okx', at: Date.now() }; return refreshDataSource(); });
+  assert.match(await page.locator('#dataFreshBadge').innerText(), /备用数据源 · OKX/);
+  await page.evaluate(() => { window.__dataSourceMock = { name: 'binance', at: Date.now() }; return refreshDataSource(); });
+  assert.doesNotMatch(await page.locator('#dataFreshBadge').innerText(), /OKX/);
+});
+
+test('持仓页：组合风险概览显示集中度 / 杠杆 / 有效独立仓位并给出警告', { skip }, async () => {
+  const { page, errors } = await open();
+  await page.evaluate(() => {
+    localStorage.setItem('novatrade_portfolio_v1', JSON.stringify([
+      { id: 'p1', symbol: 'BTCUSDT', side: 'long', qty: 1, entry: 100, lev: 10 },
+      { id: 'p2', symbol: 'ETHUSDT', side: 'long', qty: 1, entry: 100, lev: 10 },
+      { id: 'p3', symbol: 'SOLUSDT', side: 'long', qty: 1, entry: 100, lev: 10 }
+    ]));
+  });
+  await page.click(`[onclick="showView('mine')"], [data-onclick="showView('mine')"]`);
+  await page.waitForFunction(() => /组合风险概览/.test((document.getElementById('portRiskBox') || {}).innerText || ''), null, { timeout: 15000 });
+  const t = await page.locator('#portRiskBox').innerText();
+  assert.match(t, /有效独立仓位/);
+  assert.match(t, /加权杠杆\s*10\.0x/);
+  assert.match(t, /杠杆 10\.0x|加权杠杆 10\.0x/);   // 警告里也应提示高杠杆
+  assert.match(t, /方向高度单边/);
+  assert.deepEqual(errors, []);
+});

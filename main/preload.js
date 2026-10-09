@@ -56,6 +56,7 @@ try {
     llmAnalyze: (payload) => ipcRenderer.invoke('llm:analyze', payload),
     appInfo: () => ipcRenderer.invoke('app:info'),
     checkUpdate: () => ipcRenderer.invoke('update:check'),
+    openReleases: () => ipcRenderer.invoke('app:openReleases'),
     exportDiagnostics: () => ipcRenderer.invoke('diagnostics:export'),
     backupExport: (json, name) => ipcRenderer.invoke('backup:export', json, name),
     backupImport: () => ipcRenderer.invoke('backup:import')

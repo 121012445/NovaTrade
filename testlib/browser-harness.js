@@ -63,16 +63,56 @@ const MOCK_SCRIPT = `
     getFuturesPrice: async function () { return { price: '100' }; },
     fwdLoad: async function () { rec('fwdLoad', arguments); return window.__fwdStore || []; },
     fwdSave: async function (d) { rec('fwdSave', arguments); window.__fwdStore = d; return true; },
-    derivSnapshot: async function () { return { __error: 'mock' }; },
+    derivSnapshot: async function (sym) {
+      var oi = [], i;
+      for (i = 0; i < 30; i++) oi.push({ sumOpenInterestValue: String(1e9 + i * 1e7), timestamp: Date.now() - (30 - i) * 3600e3 });
+      return { symbol: sym, premium: { lastFundingRate: '0.0004', markPrice: '100', nextFundingTime: Date.now() + 3600e3 },
+        oi: oi, lsAccount: [{ longShortRatio: '1.1' }], lsTop: [{ longShortRatio: '1.4' }], taker: [{ buySellRatio: '1.08' }] };
+    },
+    getDataSource: async function () { return window.__dataSourceMock || { name: 'binance', at: Date.now() }; },
+    getHistory: async function (s, iv, bars) { rec('getHistory', arguments); return klines(s, iv, Math.min(bars, 3000)); },
     fng: async function () { return { __error: 'mock' }; },
     getFuturesDepth: async function () { return { __error: 'mock' }; },
     getAggTrades: async function () { return { __error: 'mock' }; }
   };
   var noop = function () {};
+  window.__pushCfg = { canStore: true, channels: [] };
+  window.__llmCfg = { canStore: true, configured: false, baseUrl: '', model: '', apiKey: '', useProxy: false };
+  window.__saved = [];
   window.electronAPI = new Proxy({}, {
     get: function (t, name) {
       if (name === 'getProxyStatus') return async function () { return { mode: 'direct', proxy: '', error: '' }; };
       if (name === 'notify') return async function (p) { rec('notify', [p]); return true; };
+      if (name === 'pushGetConfig') return async function () { return window.__pushCfg; };
+      if (name === 'pushSetConfig') return async function (cfg) {
+        rec('pushSetConfig', [cfg]);
+        // 模拟主进程：机密字段打码，打码占位符保留原值（这里只检查往返，不做真加密）
+        var chans = cfg.channels.map(function (c) {
+          var o = Object.assign({}, c);
+          ['botToken', 'url', 'secret'].forEach(function (f) { if (typeof o[f] === 'string' && o[f] && o[f].indexOf('••••') !== 0) o[f] = '••••' + o[f].slice(-4); });
+          return o;
+        });
+        window.__pushCfg = { canStore: true, channels: chans };
+        return { ok: true, config: window.__pushCfg };
+      };
+      if (name === 'pushTest') return async function (id) { rec('pushTest', [id]); return { ok: true, results: [{ id: id, ok: true }] }; };
+      if (name === 'llmGetConfig') return async function () { return window.__llmCfg; };
+      if (name === 'llmSetConfig') return async function (cfg) {
+        rec('llmSetConfig', [cfg]);
+        window.__llmCfg = { canStore: true, configured: !!(cfg.baseUrl && cfg.model), baseUrl: cfg.baseUrl || '', model: cfg.model || '', apiKey: cfg.apiKey ? '••••' + cfg.apiKey.slice(-4) : '', useProxy: !!cfg.useProxy };
+        return { ok: true, config: window.__llmCfg };
+      };
+      if (name === 'llmAnalyze') return async function (payload) {
+        rec('llmAnalyze', [payload]);
+        window.__lastLlmPayload = payload;
+        if (!window.__llmCfg.configured) return { ok: false, error: '尚未配置 AI 接口（设置 → AI 解读）' };
+        return { ok: true, text: '结构偏多。\\n矛盾点：15m 动能转弱。\\n以上为基于所给数据的技术解读，不构成投资建议。', model: window.__llmCfg.model };
+      };
+      if (name === 'appInfo') return async function () { return { version: '1.2.0', packaged: false, platform: 'linux', softwareRendering: false }; };
+      if (name === 'checkUpdate') return async function () { return { ok: true, newer: true, latest: '9.9.9', current: '1.2.0' }; };
+      if (name === 'backupExport') return async function (json, nm) { window.__saved.push({ json: json, name: nm }); return { ok: true, path: '/tmp/' + nm }; };
+      if (name === 'backupImport') return async function () { return window.__importData ? { ok: true, data: window.__importData } : { ok: false, canceled: true }; };
+      if (name === 'exportDiagnostics') return async function () { rec('exportDiagnostics', []); return { ok: true, path: '/tmp/diag.txt' }; };
       return function () { rec('electronAPI.' + String(name), arguments); return Promise.resolve(true); };
     }
   });

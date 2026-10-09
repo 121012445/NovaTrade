@@ -1034,6 +1034,26 @@ body {
 .bt-tag.ok { background: var(--positive-soft); color: var(--positive); }
 .bt-tag.bad { background: var(--negative-soft); color: var(--negative); }
 .bt-tag.warn { background: var(--warning-soft); color: var(--warning); }
+.set-card { border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-4); background: var(--bg-card); }
+.set-card h3 { margin: 0 0 var(--sp-2); font-size: var(--fs-md); font-weight: 600; }
+.set-note { font-size: var(--fs-xs); color: var(--text-muted); line-height: 1.7; margin: var(--sp-2) 0; }
+.set-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); align-items: flex-end; margin: var(--sp-2) 0; }
+.set-row label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-xs); color: var(--text-secondary); }
+.set-row input[type=text], .set-row input[type=password], .set-row input[type=number], .set-row select { min-width: 220px; padding: 6px 8px; background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text-primary); font-size: var(--fs-sm); }
+.set-row label.nf-check { flex-direction: row; align-items: center; gap: 6px; }
+.set-ch { border: 1px dashed var(--border); border-radius: var(--r-sm); padding: var(--sp-3); margin: var(--sp-2) 0; }
+.set-ch-title { font-weight: 600; font-size: var(--fs-sm); margin-bottom: 4px; }
+.set-result { font-size: var(--fs-xs); margin-top: var(--sp-2); }
+.set-result.ok { color: var(--positive); }
+.set-result.err { color: var(--negative); }
+.ai-explain { margin-top: var(--sp-3); border-top: 1px solid var(--border-soft); padding-top: var(--sp-3); }
+.ai-explain-head { display: flex; align-items: center; gap: var(--sp-2); font-weight: 600; font-size: var(--fs-sm); margin-bottom: 6px; }
+.ai-explain-text { font-size: var(--fs-sm); line-height: 1.8; color: var(--text-primary); }
+.ai-explain-meta { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
+.rc-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 2px; }
+.rc-chip { display: inline-block; padding: 1px 7px; border-radius: var(--r-pill); font-size: 10px; background: var(--bg-primary); border: 1px solid var(--border-soft); color: var(--text-secondary); }
+.rc-chip.up { color: var(--positive); }
+.rc-chip.down { color: var(--negative); }
 .kbd-help { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; padding: var(--sp-5); }
 .kbd-help-box { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow-3); padding: var(--sp-4) var(--sp-5); max-width: 460px; width: 100%; max-height: 78vh; overflow-y: auto; }
 .kbd-help-head { display: flex; align-items: center; justify-content: space-between; font-size: var(--fs-md); font-weight: 600; margin-bottom: var(--sp-3); }
@@ -1054,6 +1074,7 @@ body {
     <button class="rail-item" data-view="screener" onclick="showView('screener')"><span class="ri-ico">🔎</span>选币扫描</button>
     <button class="rail-item" data-view="alerts" onclick="showView('alerts')"><span class="ri-ico">⏰</span>价格预警<span class="rail-badge" id="alertBadge" style="display:none">0</span></button>
     <button class="rail-item" data-view="mine" onclick="showView('mine')"><span class="ri-ico">💼</span>持仓与复盘</button>
+    <button class="rail-item" data-view="settings" onclick="showView('settings')"><span class="ri-ico">⚙️</span>设置</button>
   </nav>
   <div class="rail-bottom">
     <div class="market-status"><span class="status-dot"></span><span id="coinCount">加载中...</span></div>
@@ -1203,6 +1224,10 @@ body {
       <div class="ana-pane active" id="m_port"><div id="portWrap"></div></div>
       <div class="ana-pane" id="m_journal"><div id="journalWrap"></div></div>
     </div></section>
+    <section id="view-settings" class="view"><div class="container">
+      <div class="section-header"><h2 class="section-title">设置</h2></div>
+      <div id="settingsWrap"><div class="empty-note">加载中…</div></div>
+    </div></section>
     <section id="trendiq" style="display:none"></section>
   </div>
 </div>
@@ -1216,7 +1241,10 @@ body {
   <script src="lib/backtest-core.js"></script>
   <script src="lib/alerts-core.js"></script>
   <script src="lib/realtime.js"></script>
+  <script src="lib/shadow-model.js"></script>
+  <script src="lib/portfolio-risk.js"></script>
   <script src="lib/inline-handlers.js"></script>
   <script src="app.js"></script>
+  <script src="settings.js"></script>
 
 </html>

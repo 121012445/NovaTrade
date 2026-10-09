@@ -175,6 +175,13 @@ var RT_URL = "wss://fstream.binance.com/ws/!miniTicker@arr";
 var rtIndex = {};
 var rtClient = null, rtDirty = false, rtLastFullLoad = 0;
 function rtHealthy() { return !!(rtClient && rtClient.healthy(10000)); }
+async function refreshDataSource() {
+  try {
+    if (!window.binanceAPI || !window.binanceAPI.getDataSource) return;
+    window.__dataSource = await window.binanceAPI.getDataSource();
+    klinePaintFresh();
+  } catch (e) {}
+}
 function startRealtime() {
   if (rtClient || typeof createReconnectingWS !== "function") return;
   rtClient = createReconnectingWS({
@@ -318,6 +325,13 @@ function klinePaintFresh() {
   const el = klineFreshBadge();
   if (!el) return;
   const st = window.__klineFresh;
+  const ds = window.__dataSource;
+  if (ds && ds.name === "okx" && Date.now() - ds.at < 180000) {
+    el.className = "fresh-badge stale";
+    el.textContent = "备用数据源 · OKX";
+    el.title = "币安暂时不可达，当前行情来自 OKX 现货公开接口（仅现货 USDT 交易对，K 线最多 300 根，无合约 / 衍生品数据）";
+    return;
+  }
   if (st.stale) {
     el.className = "fresh-badge stale";
     el.textContent = "离线数据 · " + klineFreshAge(st.at);
@@ -505,11 +519,109 @@ const FWD_1H = 3600e3, FWD_4H = 4 * 3600e3;
 async function initFwdValidation() {
   try { fwdRecords = (window.binanceAPI && await window.binanceAPI.fwdLoad()) || []; } catch(e) { fwdRecords = []; }
   fwdLoaded = true;
+  loadShadow();
   await resolveFwdSignals();
+  retrainShadow(false);
   renderFwdStats();
 }
 async function saveFwd() { try { if (window.binanceAPI) await window.binanceAPI.fwdSave(fwdRecords); } catch(e) {} }
 
+// ===== 衍生品倾向 / 影子模型 / 相对强度 / 新信号提醒 =====
+// 以下都是「附加信息」：只展示与记录，不参与评分与门控。是否有用由前向验证事后检验。
+window.__derivSigCache = window.__derivSigCache || {};
+// 把 derivVerdict 的逐条结论折成一个整数：看多条数 − 看空条数（夹到 ±4）。无数据返回 null。
+function derivSignalFrom(d, ctx) {
+  if (!d) return null;
+  var v = derivVerdict(d, ctx), s = 0;
+  v.forEach(function (x) { if (x.cls === "buy") s++; else if (x.cls === "sell") s--; });
+  return v.length ? { s: Math.max(-4, Math.min(4, s)), n: v.length } : null;
+}
+function derivTilt(s) { return s >= 2 ? "偏多" : s <= -2 ? "偏空" : "中性"; }
+async function derivSignalFor(sym) {
+  var c = window.__derivSigCache[sym];
+  if (c && Date.now() - c.ts < 300000) return c.v;
+  var d = null;
+  try {
+    d = await Promise.race([window.binanceAPI.derivSnapshot(sym, "1h", 30), new Promise(function (r) { setTimeout(function () { r(null); }, 6000); })]);
+  } catch (e) { d = null; }
+  if (!d || d.__error || !d.premium || d.premium.__error) { window.__derivSigCache[sym] = { ts: Date.now(), v: null }; return null; }
+  var co = (allCoins || []).find(function (x) { return x.symbol === sym; });
+  var v = derivSignalFrom(d, { priceChg: co ? co.change : NaN });
+  window.__derivSigCache[sym] = { ts: Date.now(), v: v };
+  return v;
+}
+var SM_KEY = "novatrade_shadow_v1";
+var shadowState = null;
+function loadShadow() {
+  try { var j = JSON.parse(localStorage.getItem(SM_KEY) || "null"); if (j && typeof j === "object") shadowState = j; } catch (e) {}
+}
+function shadowReadyModel() { return shadowState && shadowState.ready && shadowState.model ? shadowState.model : null; }
+function retrainShadow(force) {
+  if (typeof smFit !== "function") return;
+  var withFeat = fwdRecords.filter(function (r) { return r.feat && r.r4h; }).length;
+  var last = shadowState ? shadowState.n : -1;
+  // 样本没明显增加就不重训：积累阶段每次变化都更新计数；达标后每新增 20 条才重训
+  if (!force && shadowState && withFeat === last) return;
+  if (!force && shadowState && shadowState.n >= SM_MIN_SAMPLES && withFeat - last < 20) return;
+  try {
+    shadowState = smFit(fwdRecords);
+    localStorage.setItem(SM_KEY, JSON.stringify(shadowState));
+  } catch (e) { console.warn("[app] shadow model failed:", e && e.message); }
+}
+// 推荐扫描结束后的补充信息：相对强度、衍生品倾向（仅 Top 候选，避免多发请求）、特征向量与影子模型概率
+async function enrichPicks(valid, buyPool, sellPool) {
+  var btcCoin = (allCoins || []).find(function (c) { return c.symbol === "BTCUSDT"; });
+  var btcChg = btcCoin ? btcCoin.change : NaN;
+  var btcScore = window.__btcRegime ? window.__btcRegime.score : 50;
+  var picks = buyPool.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 6)
+    .concat(sellPool.slice().sort(function (a, b) { return a.score - b.score; }).slice(0, 6));
+  var i = 0;
+  await Promise.all([0, 1, 2].map(async function () {
+    while (i < picks.length) { var a = picks[i++]; var v = await derivSignalFor(a.symbol); if (v) a.dv = v; }
+  }));
+  var model = shadowReadyModel();
+  valid.forEach(function (a) {
+    a.rs = (isFinite(btcChg) && isFinite(a.change)) ? a.change - btcChg : NaN;
+    try { a.feat = smFeatures(a, { btcScore: btcScore, dv: a.dv ? a.dv.s : 0 }); if (model) a.sm = smPredict(model, a.feat); } catch (e) {}
+  });
+}
+// 新信号提醒（默认关闭）：同一币同一方向 4 小时内只提醒一次
+var SIGNAL_NOTIFY_KEY = "novatrade_signal_notify";
+var SIGNAL_NOTIFIED_KEY = "novatrade_signal_notified";
+function signalNotifyEnabled() { try { return localStorage.getItem(SIGNAL_NOTIFY_KEY) === "1"; } catch (e) { return false; } }
+function setSignalNotify(on) { try { localStorage.setItem(SIGNAL_NOTIFY_KEY, on ? "1" : "0"); } catch (e) {} }
+function notifyNewSignals(buy, sell, quality) {
+  if (!signalNotifyEnabled()) return 0;
+  var seen = {};
+  try { seen = JSON.parse(localStorage.getItem(SIGNAL_NOTIFIED_KEY) || "{}"); } catch (e) { seen = {}; }
+  var now = Date.now(), sent = 0;
+  Object.keys(seen).forEach(function (k) { if (now - seen[k] > 24 * 3600e3) delete seen[k]; });
+  function one(c, dir) {
+    var key = c.symbol + "|" + dir;
+    if (seen[key] && now - seen[key] < 4 * 3600e3) return;
+    seen[key] = now; sent++;
+    var base = splitSymbol(c.symbol).base;
+    var title = base + (dir === "long" ? " 出现看涨信号" : " 出现看跌信号") + (quality && quality.actionable ? "" : "（仅观察）");
+    var body = "评分 " + Math.round(c.score) + " · 置信度 " + c.confidence + "%" + (c.riskReward ? " · 入场 " + formatPrice(c.riskReward.entry) + " 止损 " + formatPrice(c.riskReward.stopLoss) : "") +
+      (c.dv ? " · 衍生品" + derivTilt(c.dv.s) : "");
+    try { pushNotify(title, body); } catch (e) {}
+  }
+  (buy || []).slice(0, 3).forEach(function (c) { one(c, "long"); });
+  (sell || []).slice(0, 3).forEach(function (c) { one(c, "short"); });
+  try { localStorage.setItem(SIGNAL_NOTIFIED_KEY, JSON.stringify(seen)); } catch (e) {}
+  return sent;
+}
+// 事后对比：衍生品倾向与信号方向一致 / 不一致时，4h 方向命中率各是多少
+function fwdDerivSplit() {
+  var agree = [], disagree = [];
+  fwdRecords.forEach(function (r) {
+    if (!r.r4h || typeof r.dv !== "number" || r.dv === 0) return;
+    ((r.dir === "long") === (r.dv > 0) ? agree : disagree).push(r);
+  });
+  var rate = function (a) { return a.length ? a.filter(function (r) { return r.r4h.hit; }).length / a.length * 100 : null; };
+  return { agree: { n: agree.length, rate: rate(agree) }, disagree: { n: disagree.length, rate: rate(disagree) } };
+}
+window.fwdDerivSplit = fwdDerivSplit;
 function recordFwdSignals(analyses, skipShortSyms, skipLongSyms, sellGateDetail, buyGateDetail) {
   if (!fwdLoaded || !Array.isArray(analyses)) return;
   const now = Date.now();
@@ -548,6 +660,8 @@ function recordFwdSignals(analyses, skipShortSyms, skipLongSyms, sellGateDetail,
     if (dup) continue;
     const rec = { ts: now, symbol: a.symbol, dir: dir, score: Math.round(a.score), price: a.price, r1h: null, r4h: null, resolved: false };
     rec.gated = gated; rec.gates = gates;
+    rec.feat = a.feat || null;                         // 影子模型的训练特征（见 lib/shadow-model.js）
+    rec.dv = a.dv ? a.dv.s : null;                     // 衍生品倾向（未经验证，仅用于事后对比）
     fwdRecords.push(rec);
     added++;
   }
@@ -612,7 +726,7 @@ async function resolveFwdSignals() {
     if (r.r1h !== null && r.r4h !== null) r.resolved = true;
     else if (age > FWD_EXPIRE_AFTER) { r.resolved = true; r.expired = true; changed = true; }   // 取不到结算价：标记无数据，不计入命中率
   }
-  if (changed) await saveFwd();
+  if (changed) { await saveFwd(); retrainShadow(false); }
 }
 
 function fwdStatsCalc() {
@@ -641,6 +755,19 @@ function fwdQualityStatus() {
   };
 }
 
+function fwdExtraStatsHtml() {
+  var out = "";
+  var sp = fwdDerivSplit();
+  if (sp.agree.n >= 5 && sp.disagree.n >= 5) {
+    out += "<span title=\"衍生品倾向与信号方向一致 / 不一致时的 4h 方向命中率（未经验证的附加信息，样本少时仅供参考）\">衍生品一致<b>" + sp.agree.rate.toFixed(0) + "%</b>(n=" + sp.agree.n + ") / 不一致<b>" + sp.disagree.rate.toFixed(0) + "%</b>(n=" + sp.disagree.n + ")</span>";
+  }
+  if (shadowState) {
+    var o = shadowState.oos;
+    out += "<span title=\"用前向验证记录训练的逻辑回归，只展示不参与决策；样本外 AUC≥0.55 且 Brier 优于基线才显示概率\">影子模型<b>" + (shadowState.ready ? "有效" : "未就绪") + "</b>" +
+      (o && o.auc !== null ? "(AUC " + o.auc.toFixed(2) + ")" : "") + "</span>";
+  }
+  return out;
+}
 function renderFwdStats() {
   const el = document.getElementById("fwdStats");
   if (!el) return;
@@ -654,6 +781,7 @@ function renderFwdStats() {
     "<span>4h 方向命中<b class=\"" + cls(s.h4.hitRate) + "\">" + fmt(s.h4.hitRate) + "</b> (n=" + s.h4.n + ")</span>" +
     (s.h1.avgPct !== null ? "<span>1h 方向均值收益<b class=\"" + cls(s.h1.avgPct, 0) + "\">" + (s.h1.avgPct >= 0 ? "+" : "") + s.h1.avgPct.toFixed(2) + "%</b></span>" : "") +
     "<span>待结算<b>" + s.pending + " 条</b></span>" +
+    fwdExtraStatsHtml() +
     "<span class=\"fwd-health " + (quality.actionable ? "healthy" : "weak") + "\">策略状态<b>" + quality.label + "</b></span>";
   // 台账与统计同源，跟着一起刷新
   try { renderFwdLedger(); } catch (e) { console.error("[app] ledger:", e); }
@@ -817,7 +945,7 @@ async function selectCoin(symbol) {
   }
 }
 // ===== 视图路由（桌面外壳） =====
-const VIEW_TITLES = { market: "市场概览", recommend: "AI 智能推荐", analysis: "AI 深度分析", linkage: "联动全景", screener: "选币扫描", alerts: "价格预警", mine: "持仓与复盘" };
+const VIEW_TITLES = { market: "市场概览", recommend: "AI 智能推荐", analysis: "AI 深度分析", linkage: "联动全景", screener: "选币扫描", alerts: "价格预警", mine: "持仓与复盘", settings: "设置" };
 function showView(name) {
   window.__currentView = name;
   document.querySelectorAll(".views .view").forEach(v => v.classList.toggle("active", v.id === "view-" + name));
@@ -838,6 +966,7 @@ function showView(name) {
   // 2026-10-09 第十批：价格预警 / 我的交易（同样是懒渲染）
   if (name === "alerts") { try { renderAlerts(); } catch(e) { console.error("[app] alerts view:", e); } }
   if (name === "mine") { try { renderMine(); } catch(e) { console.error("[app] mine view:", e); } }
+  if (name === "settings") { try { if (window.renderSettings) renderSettings(); } catch(e) { console.error("[app] settings view:", e); } }
 }
 window.showView = showView;
 // 分析区标签页切换（事件委托，绑定一次）
@@ -856,6 +985,62 @@ document.addEventListener("click", function(e) {
   if (b.dataset.pane === "p_size") { try { renderSizeCalc(); } catch (err) { console.error("[app] size pane:", err); } }
 });
 
+// ===== AI 解读（大语言模型，见 main/llm.js）=====
+// 只把应用已算好的摘要发给模型，让它用中文解读；不下单、不预测价格。结果按币种缓存 30 分钟，
+// 因为分析面板每 10 秒会整体重绘，结果必须存在内存里而不是 DOM 上。
+window.__aiExplain = window.__aiExplain || {};
+function aiExplainHtml(symbol) {
+  const e = window.__aiExplain[symbol];
+  const btn = '<button class="btn-ghost" onclick="aiExplain()">' + (e && e.text ? "重新解读" : "AI 解读") + '</button>';
+  if (e && e.loading) return '<div class="ai-explain-head">AI 解读</div><div class="ai-rr-placeholder">正在请求模型…</div>';
+  if (e && e.text && Date.now() - e.ts < 30 * 60e3) {
+    const age = Math.max(0, Math.round((Date.now() - e.ts) / 60000));
+    return '<div class="ai-explain-head">AI 解读 ' + btn + '</div>' +
+      '<div class="ai-explain-text">' + escapeHtml(e.text).replace(/\n/g, "<br>") + '</div>' +
+      '<div class="ai-explain-meta">模型 ' + escapeHtml(e.model || "") + ' · ' + age + ' 分钟前生成 · 仅基于上方已计算的数据，不构成投资建议</div>';
+  }
+  const err = e && e.error ? '<div class="ai-explain-meta" style="color:var(--negative)">' + escapeHtml(e.error) + '</div>' : "";
+  return '<div class="ai-explain-head">AI 解读 ' + btn + '</div>' + err +
+    '<div class="ai-explain-meta">把本页的评分、信号、风险回报与衍生品数据交给大模型，生成一段中文解读（需先在「设置」里配置接口）。</div>';
+}
+function buildAiPayload(symbol, a) {
+  const q = fwdQualityStatus();
+  const dvc = (window.__derivSigCache || {})[symbol];
+  const rr = a.riskReward;
+  return {
+    symbol: symbol,
+    price: a.price, change24hPct: a.change,
+    score: a.score, confidence: a.confidence, direction: a.trendDir, recommendation: a.rec, marketState: a.marketState,
+    timeframes: (a.tfData || []).map(function (r) { return { tf: r.interval, score: r.analysis.score, marketState: r.analysis.marketState }; }),
+    signals: (a.signals || []).slice(0, 14).map(function (s) { return (s.t === "bull" ? "[多] " : s.t === "bear" ? "[空] " : "[中] ") + s.n; }),
+    indicators: a.indicators,
+    volumeRatio: a.volRatio,
+    riskReward: rr ? { direction: rr.direction, entry: rr.entry, stopLoss: rr.stopLoss, takeProfits: (rr.tps || []).map(function (t) { return t.price; }), rr: rr.rr, riskPct: rr.riskPct } : null,
+    supports: (a.supports || []).slice(0, 3).map(function (x) { return x.price; }),
+    resistances: (a.resistances || []).slice(0, 3).map(function (x) { return x.price; }),
+    gates: { overheatVeto: !!a.overheatVeto, shortVeto: !!a.shortVeto, nearSupportVeto: !!a.nearSupportVeto, stopCapVeto: !!a.stopCapVeto },
+    btcRegime: window.__btcRegime ? { score: window.__btcRegime.score, adx: window.__btcRegime.adx } : null,
+    derivativesBias: dvc && dvc.v ? { score: dvc.v.s, tilt: derivTilt(dvc.v.s) } : null,
+    forwardValidation: { status: q.label, h1HitPct: q.stats.h1.hitRate, h1N: q.stats.h1.n, h4HitPct: q.stats.h4.hitRate, h4N: q.stats.h4.n }
+  };
+}
+async function aiExplain() {
+  const d = window.__lastAnalysisData;
+  if (!d || !d.a) { linkedToast("请先选择一个币种并等待分析完成"); return; }
+  if (!window.electronAPI || !window.electronAPI.llmAnalyze) { linkedToast("当前环境不支持 AI 解读"); return; }
+  const sym = d.symbol;
+  window.__aiExplain[sym] = { loading: true };
+  const paint = function () { const box = document.getElementById("aiExplainBox"); if (box && anaIsCurrentTarget(sym)) box.innerHTML = aiExplainHtml(sym); };
+  paint();
+  try {
+    const r = await window.electronAPI.llmAnalyze(buildAiPayload(sym, d.a));
+    window.__aiExplain[sym] = r && r.ok ? { text: r.text, model: r.model, ts: Date.now() } : { error: (r && (r.error || r.__error)) || "解读失败" };
+  } catch (e) {
+    window.__aiExplain[sym] = { error: "解读失败：" + (e && e.message) };
+  }
+  paint();
+}
+window.aiExplain = aiExplain;
 async function loadAnalysis(symbol) { 
   const main = document.getElementById("analysisMain");
   main.innerHTML = "<div class=\"analysis-placeholder\"><p>正在多周期分析...</p></div>";
@@ -2694,6 +2879,7 @@ function renderAnalysis(symbol, a, klines) {
     "<div class=\"ai-recommendation\"><span class=\"ai-trend\">多周期动能: " + escapeHtml(a.trendDir) + "</span></div>" +
     "<p class=\"ai-text\">" + escapeHtml(a.text) + "</p>" +
     "<div class=\"ai-factors\">" + signalsHtml + "</div>" +
+    "<div class=\"ai-explain\" id=\"aiExplainBox\">" + aiExplainHtml(symbol) + "</div>" +
     "</div></div>" +
     "<div class=\"" + paneCls("p_ind") + "\" id=\"p_ind\">" +
     "<div class=\"vote-panel\" id=\"votePanel\"></div>" +
@@ -2880,6 +3066,21 @@ function renderRecommendGroup(groupId, list, dir, quality, blockedCount, gateNot
   el.innerHTML = `<div class="recommend-card-header rec-group ${dir}"><h3>${title} ${label} (${list.length}个)${note}</h3></div>`
     + list.map(co => renderRecommendCard(co, quality)).join("");
 }
+// 扫描范围：成交额前 N 的币（N 可选 10 / 20 / 40 / 80，默认 10）。越大越慢、请求越多（每币 4 个周期各 1 次）。
+var SCAN_KEY = "novatrade_scan_n";
+var SCAN_CHOICES = [10, 20, 40, 80];
+function scanSize() {
+  var n = 10;
+  try { n = parseInt(localStorage.getItem(SCAN_KEY), 10); } catch (e) {}
+  return SCAN_CHOICES.indexOf(n) >= 0 ? n : 10;
+}
+function setScanSize(n) {
+  n = parseInt(n, 10);
+  if (SCAN_CHOICES.indexOf(n) < 0) return false;
+  try { localStorage.setItem(SCAN_KEY, String(n)); } catch (e) {}
+  return true;
+}
+window.scanSize = scanSize; window.setScanSize = setScanSize;
 async function renderRecommendations() { const grid = document.getElementById("recommendGrid"); if(!grid) return;
   const usingCache = !!grid.querySelector(".recommend-card") || restoreRecommendationSnapshot(grid);
   if (!usingCache) grid.innerHTML = "<div class=\"recommend-placeholder\"><p>正在准备推荐分析...</p></div>";
@@ -2889,7 +3090,7 @@ async function renderRecommendations() { const grid = document.getElementById("r
     if (isFinite(adxV)) window.__btcRegime = { score: btcAnalysis.score, adx: adxV, ts: Date.now() };
   }
   console.log("[app] renderRecommendations btcAnalysis:", btcAnalysis ? "ok" : "null");
-  const topCoins = allCoins.filter(c => c.volume > 10000000).slice(0, 10);
+  const topCoins = allCoins.filter(c => c.volume > 10000000).slice(0, scanSize());
   console.log("[app] renderRecommendations topCoins:", topCoins.length);
   updateRecommendationProgress(grid, 0, topCoins.length, usingCache);
   const analyses = [];
@@ -2947,6 +3148,7 @@ async function renderRecommendations() { const grid = document.getElementById("r
   }));
   const valid = analyses;
   if (!skeletonReady) { ensureRecommendSkeleton(grid, usingCache); skeletonReady = true; progressiveRender(); }
+  try { await enrichPicks(valid, buyPool, sellPool); } catch (e) { console.warn("[app] enrichPicks failed:", e && e.message); }
   recordFwdSignals(valid, gatedSellSet, gatedBuySet, sellGateDetail, buyGateDetail); renderFwdStats();
   const quality = fwdQualityStatus();
   const bullCount = valid.filter(a => a.score >= SIGNAL_LONG_MIN).length;
@@ -2956,6 +3158,7 @@ async function renderRecommendations() { const grid = document.getElementById("r
   const be=document.getElementById("bearCount"); if(be) be.textContent = bearCount;
   // 收尾：最终一致性渲染（排序/截断/gate-note 均以全量数据为准）
   progressiveRender();
+  try { notifyNewSignals(window.__recGroups && window.__recGroups.buy, window.__recGroups && window.__recGroups.sell, quality); } catch (e) {}
   saveRecommendationSnapshot(grid.innerHTML);
   renderLinkedSummary();
 }
@@ -3135,6 +3338,16 @@ function checkLinkedFeatures() {
   saveLinkedState(s);
   renderLinkedSummary(); // 每 30 秒刷新现价/浮盈（此前仅在状态变化时刷新，浮盈长期不动）
 }
+function recommendChipsHtml(c, isBuy) {
+  const chips = [];
+  if (isFinite(c.rs)) chips.push(`<span class="rc-chip ${c.rs >= 0 ? "up" : "down"}" title="24h 涨跌幅减去 BTC 的 24h 涨跌幅（相对强弱）">相对BTC ${c.rs >= 0 ? "+" : ""}${c.rs.toFixed(1)}%</span>`);
+  if (c.dv) {
+    const agree = isBuy ? c.dv.s > 0 : c.dv.s < 0;
+    chips.push(`<span class="rc-chip ${c.dv.s === 0 ? "" : (agree ? "up" : "down")}" title="资金费率 / 持仓量 / 多空比 / 主动买卖的综合倾向（看多条数 − 看空条数）。未经验证，仅记录并与前向结果事后对比，不参与评分">衍生品${derivTilt(c.dv.s)} ${c.dv.s > 0 ? "+" : ""}${c.dv.s}</span>`);
+  }
+  if (isFinite(c.sm)) chips.push(`<span class="rc-chip" title="影子模型预测的 4h 方向命中概率。仅在样本外检验有效时显示，不参与评分与门控">影子模型 ${(c.sm * 100).toFixed(0)}%</span>`);
+  return chips.length ? `<div class="rc-chips">${chips.join("")}</div>` : "";
+}
 function renderRecommendCard(c, quality) {
   const isBuy = c.badge.includes("buy");
   const directionCode = isBuy ? "long" : "short";
@@ -3182,6 +3395,7 @@ function renderRecommendCard(c, quality) {
     <div class="recommend-card-confidence">模型置信度 ${c.confidence}% · ${tradeBlocked ? "仅方向观察" : "风险参数已生成"}</div>
     <div class="recommend-card-signals"><span class="signal-bull">▲ ${bullish} 条看涨证据</span><span class="signal-bear">▼ ${bearish} 条看跌证据</span></div>
     <div class="recommend-card-reason">${escapeHtml(reasons || "暂无足够同向证据")}</div>
+    ${recommendChipsHtml(c, isBuy)}
     ${riskHtml}
     <div class="recommend-card-actions">
       <button onclick="event.stopPropagation();openLinkedAnalysis('${escapeJsAttr(sym)}','${directionCode}',${Number(c.score)},${Number(c.confidence)},'${escapeJsAttr(c.baseTf || "4h")}')">联动分析</button>
@@ -3609,6 +3823,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     try { window.__trendIQReady = true; if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol) selectTrendIQCoin("BTC"); } catch(e) { console.error("[app] TrendIQ init failed:", e); }
     // widget creation disabled at startup to fix main window handle
   } catch(e) { console.error("启动失败:", e); const el = document.getElementById("coinCount"); if (el) el.textContent = "连接失败"; }
+  appInterval(refreshDataSource, 15000);
   appInterval(async () => { if (!(rtHealthy() && Date.now() - rtLastFullLoad < 120000)) await loadAllCoins(); checkLinkedFeatures(); renderMarket(currentFilter); renderSidebar(); try { checkAlerts(); } catch(e) {} try { pushTrayStatus(); } catch(e) {} try { if (document.getElementById("trendiqAIAnalysis") && !trendiqCurrentSymbol && window.__trendIQCoins && window.__trendIQCoins.length > 0) selectTrendIQCoin(window.__trendIQCoins[0].symbol); } catch(e) {} }, 30000);
   appInterval(async () => {
     // 2026-10-10：先锁定币种再发请求。原来在 await 之后才读 selectedCoin，
@@ -4702,6 +4917,45 @@ function portExportCsv() {
   var stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
   downloadText("组合持仓_" + stamp + ".csv", csv);
 }
+// ---- 持仓风险概览：集中度 / 净敞口 / 加权杠杆 / 相关性折算后的有效独立仓位数（见 lib/portfolio-risk.js）----
+window.__portCorr = window.__portCorr || {};   // symbol -> { ts, r: 对数收益率序列 }
+async function portReturns(sym) {
+  var c = window.__portCorr[sym];
+  if (c && Date.now() - c.ts < 10 * 60e3) return c.r;
+  var r = null;
+  try {
+    var kl = await window.binanceAPI.getKlines(sym, "1h", 120);
+    if (Array.isArray(kl) && !kl.__error && kl.length > 30) r = logReturns(dropOpenCandle(kl).map(function (k) { return parseFloat(k[4]); }));
+  } catch (e) { r = null; }
+  window.__portCorr[sym] = { ts: Date.now(), r: r };
+  return r;
+}
+async function portRiskFill() {
+  var box = document.getElementById("portRiskBox");
+  if (!box) return;
+  var rows = loadPortfolio().map(portRow).filter(function (r) { return r.notional > 0; });
+  if (!rows.length) { box.innerHTML = ""; return; }
+  var syms = Array.from(new Set(rows.map(function (r) { return r.p.symbol; })));
+  var series = {};
+  await Promise.all(syms.map(async function (s) { series[s] = await portReturns(s); }));
+  var corrOf = function (a, b) {
+    var x = series[a], y = series[b];
+    return x && y ? pearson(x, y) : null;
+  };
+  var risk = prRisk(rows.map(function (r) { return { symbol: r.p.symbol, side: r.p.side, notional: r.notional, lev: r.p.lev }; }), corrOf);
+  var box2 = document.getElementById("portRiskBox");
+  if (!risk || !box2) return;
+  var chip = function (label, value, title) { return '<div class="port-card"' + (title ? ' title="' + escapeHtml(title) + '"' : "") + '><div class="pc-label">' + label + '</div><div class="pc-value">' + value + '</div></div>'; };
+  box2.innerHTML = '<div class="mini-title">组合风险概览</div><div class="port-cards">' +
+    chip("最大单笔占比", risk.top.pct.toFixed(0) + "%", risk.top.symbol) +
+    chip("净敞口", (risk.net >= 0 ? "+" : "") + sizeMoney(risk.net) + "（" + (risk.netPct >= 0 ? "+" : "") + risk.netPct.toFixed(0) + "%）", "多头名义 − 空头名义") +
+    chip("加权杠杆", risk.avgLev.toFixed(1) + "x") +
+    chip("平均相关（按方向）", risk.avgCorr === null ? "--" : risk.avgCorr.toFixed(2), "近 120 根 1h 收益率；做多 A 同时做空 B 且 A、B 正相关时为负（对冲）") +
+    chip("有效独立仓位", risk.neff.toFixed(1) + " / " + risk.n, "把相关性折算后，这些仓位相当于多少笔彼此独立的仓位") +
+    '</div>' +
+    (risk.warnings.length ? '<div class="port-warn">' + risk.warnings.map(escapeHtml).join("<br>") + '</div>' : '<div class="size-note">未发现明显的集中度 / 相关性 / 杠杆风险。</div>');
+}
+window.portRiskFill = portRiskFill;
 function portHtml() {
   var s = portStats();
   var form =
@@ -4732,7 +4986,8 @@ function portHtml() {
     ? '<div class="port-bar"><i style="width:' + (s.longNotional / totalN * 100).toFixed(2) + '%;background:var(--positive)"></i><i style="width:' + (s.shortNotional / totalN * 100).toFixed(2) + '%;background:var(--negative)"></i></div>' +
       '<div style="font-size:var(--fs-xs);color:var(--text-muted);margin-top:4px">多头敞口 ' + (s.longNotional / totalN * 100).toFixed(1) + '% · 空头敞口 ' + (s.shortNotional / totalN * 100).toFixed(1) + '%</div>'
     : "";
-  var warn = s.missing ? '<div class="port-warn">有 ' + s.missing + ' 个持仓的现价尚未加载（该币可能不在前 1489 个交易对里），暂未计入浮动盈亏</div>' : "";
+  setTimeout(portRiskFill, 0);   // 风险概览要拉 K 线算相关性，异步填入下面的容器
+  var warn = '<div id="portRiskBox"></div>' + (s.missing ? '<div class="port-warn">有 ' + s.missing + ' 个持仓的现价尚未加载（该币可能不在前 1489 个交易对里），暂未计入浮动盈亏</div>' : "");
   var rows = s.rows.map(function (r) {
     var dirMul = r.p.side === "long" ? 1 : -1;
     var cls = r.pnl === null ? "" : (r.pnl >= 0 ? "up" : "down");

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, Notification, dialog, session, safeStorage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, Notification, dialog, session, safeStorage, shell } = require('electron');
 const path = require('path');
 
 // GPU：默认启用硬件加速；只有显式要求或 GPU 进程连续崩溃时才降级为软件渲染（见 main/gpu-config.js）。
@@ -795,6 +795,8 @@ ipcHandle('update:check', async () => {
     request: (host, urlPath) => binanceHttp.requestJson({ family: 'generic:' + host, hosts: [host], path: urlPath, agent: agentFor(futuresProxy || spotProxy, 2), proxyKey: futuresProxy || spotProxy || 'direct', timeoutMs: 10000 })
   });
 });
+// 只允许打开本项目的发布页（固定地址，不接受渲染层传入的 URL）
+ipcHandle('app:openReleases', () => { shell.openExternal('https://github.com/' + UPDATE_REPO + '/releases'); return true; });
 ipcHandle('diagnostics:export', async () => {
   let errorLog = '';
   try { errorLog = fs.readFileSync(ensureLogFile(), 'utf8'); } catch (err) { /* 还没有日志 */ }
