@@ -1149,6 +1149,7 @@ body {
           <button class="time-btn" data-range="4h">4h</button>
           <button class="time-btn" data-range="1d">1d</button>
           <button class="time-btn" data-range="1w">1w</button>
+          <button class="btn-ghost tb-export" id="sigMarkToggle" onclick="toggleSignalMarks()" title="在 K 线上标出该币历史推荐信号（绿 = 4h 后方向命中，红 = 未中，灰 = 待结算；「拦」= 被门控拦截）与模拟跟踪">信号标注</button>
           <button class="btn-ghost tb-export" onclick="exportChartPng()" title="把当前主图导出为 PNG（按图表当前尺寸导出，窗口开大一点图更清晰）">导出图片</button></div>
           <div id="tvChart" class="chart-container"></div>
         </div>
@@ -1247,6 +1248,7 @@ body {
   <script src="lib/shadow-model.js"></script>
   <script src="lib/portfolio-risk.js"></script>
   <script src="lib/fwd-attribution.js"></script>
+  <script src="lib/signal-marks.js"></script>
   <script src="lib/inline-handlers.js"></script>
   <script src="app.js"></script>
   <script src="settings.js"></script>

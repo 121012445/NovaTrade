@@ -62,6 +62,35 @@
       '<div class="set-note">扫描范围越大，每轮请求越多（每个币 4 个周期各一次，3 分钟一轮）。新信号提醒默认关闭；同一币同一方向 4 小时内只提醒一次，带「仅观察」标记表示前向验证尚未达标。</div></div>';
   }
 
+  var GATE_INFO = [
+    ["overheat", "过热区：70–74 分不做多", "依据作者早期约 7–14 条样本的 4h 命中率定下"],
+    ["daily", "日线趋势门控", "做多需日线 EMA20>EMA50 或收盘在 EMA20 上方；做空反之"],
+    ["stopCap", "止损距离上限", "止损距离超过价格的 " + (window.MAX_STOP_PCT || 15) + "% 不给信号"],
+    ["score39", "空头评分门槛", "开启：评分 <39 才做空；关闭：放宽到 <45"],
+    ["btcVeto", "BTC 偏多时否决做空", "BTC 处于明确上升趋势时不做空山寨"],
+    ["nearSup", "距支撑 <1ATR 不做空", "避免在支撑位附近追空"]
+  ];
+  function gateCardHtml() {
+    var g = window.gateCfg ? window.gateCfg() : {};
+    return '<div class="set-card"><h3>门控开关</h3>' +
+      '<div class="set-note">门控会拦下一部分信号（台账里显示「已拦截」）。关闭某道门控后，它不再拦截信号，但台账仍会记录「这道门控本来会不会拦」，' +
+      '所以「门控归因」表可以继续比较两组的表现。建议只在归因表显示「拦下的反而更好」且样本足够时再关闭。改动从下一轮推荐开始生效。</div>' +
+      GATE_INFO.map(function (x) {
+        return '<div class="set-row"><label class="nf-check"><input type="checkbox" data-gate="' + x[0] + '"' + (g[x[0]] !== false ? " checked" : "") +
+          ' onchange="settingsSaveGates()"><span><b>' + esc(x[1]) + '</b> <span class="set-note">' + esc(x[2]) + '</span></span></label></div>';
+      }).join("") +
+      '<div class="set-row"><button class="btn-ghost" onclick="settingsResetGates()">全部恢复默认（开启）</button></div>' +
+      '<div id="gateMsg" class="set-result"></div></div>';
+  }
+  window.settingsSaveGates = function () {
+    var cfg = {};
+    document.querySelectorAll("[data-gate]").forEach(function (el) { cfg[el.getAttribute("data-gate")] = el.checked; });
+    var out = window.saveGateCfg(cfg);
+    var off = Object.keys(out).filter(function (k) { return !out[k]; });
+    msg("gateMsg", off.length ? "已关闭 " + off.length + " 道门控，下一轮推荐生效" : "全部门控已开启", true);
+  };
+  window.settingsResetGates = function () { window.saveGateCfg({}); renderSettings(); toast("门控已全部恢复为开启"); };
+
   function llmCardHtml() {
     var c = S.llm || {};
     return '<div class="set-card"><h3>AI 解读</h3>' +
@@ -107,7 +136,7 @@
       if (a.pushGetConfig) { var pc = await a.pushGetConfig(); if (pc && pc.channels) { S.channels = pc.channels; S.canStore = pc.canStore !== false; } }
       if (a.llmGetConfig) S.llm = await a.llmGetConfig();
     } catch (e) { console.warn("[settings] load failed:", e && e.message); }
-    root.innerHTML = pushCardHtml() + generalCardHtml() + llmCardHtml() + dataCardHtml() + aboutCardHtml() + disclaimerHtml();
+    root.innerHTML = pushCardHtml() + generalCardHtml() + gateCardHtml() + llmCardHtml() + dataCardHtml() + aboutCardHtml() + disclaimerHtml();
     try {
       var info = a.appInfo ? await a.appInfo() : null;
       var ds = window.__dataSource;

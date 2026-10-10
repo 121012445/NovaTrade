@@ -312,11 +312,70 @@ test('信号台账：门控归因表按方向显示放行 / 被拦截两组的�
   const p = { overheat: false, dailyOK: true, stopCapVeto: false };
   for (let i = 0; i < 30; i++) recs.push({ ts: now - i * 60e3, symbol: 'AUSDT', dir: 'long', score: 66, price: 1, gated: true, gates: p, resolved: true, r1h: { price: 1, pct: 0.1, hit: i < 10 }, r4h: { price: 1, pct: i < 9 ? 1 : -1, hit: i < 9 } });
   for (let i = 0; i < 30; i++) recs.push({ ts: now - i * 60e3, symbol: 'BUSDT', dir: 'long', score: 72, price: 1, gated: false, gates: g, resolved: true, r1h: { price: 1, pct: 0.1, hit: true }, r4h: { price: 1, pct: i < 25 ? 1 : -1, hit: i < 25 } });
-  const { page } = await open(`window.__fwdStore = ${JSON.stringify(recs)};`);
+  // 这些测试记录没有评分版本字段，切到「全部版本」口径
+  const { page } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.setItem('novatrade_ledger_scope', 'all');`);
   await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
   await page.waitForFunction(() => /门控归因/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 15000 });
-  const t = await page.locator('#fwdLedger .fa-wrap').innerText();
+  const t = await page.locator('#fwdLedger .fa-wrap:has-text("门控归因")').innerText();
   assert.match(t, /多头信号/);
   assert.match(t, /仅被「过热区（70–74 分不做多）」拦截/);
   assert.match(t, /拦下的反而更好/);
+});
+
+test('K 线信号标注：标出该币的历史信号；从台账点进来会画出入场 / 止损 / 目标线；可关闭', { skip }, async () => {
+  const H = 3600e3, base = Math.floor(Date.now() / H) * H;
+  const recs = [
+    { ts: base - 20 * H + 60e3, symbol: 'BTCUSDT', dir: 'long', score: 68, price: 100, sl: 95, tp: 110, gated: true, gates: {}, resolved: true, r1h: { hit: true, pct: 1 }, r4h: { hit: true, pct: 2 } },
+    { ts: base - 10 * H + 60e3, symbol: 'BTCUSDT', dir: 'short', score: 35, price: 105, gated: false, gates: {}, resolved: true, r1h: { hit: false, pct: 1 }, r4h: { hit: false, pct: 1 } },
+    { ts: base - 5 * H, symbol: 'ETHUSDT', dir: 'long', score: 70, price: 1, gated: true, gates: {} }
+  ];
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)};`);
+  await page.evaluate((ts) => openLedgerSignal('BTCUSDT', ts), recs[0].ts);
+  await page.waitForFunction(() => window.__sigMarkApi && window.__sigMarkApi.markers().length >= 2, null, { timeout: 15000 });
+  const m = await page.evaluate(() => window.__sigMarkApi.markers().map((x) => x.text));
+  assert.ok(m.includes('多68✓'), JSON.stringify(m));
+  assert.ok(m.includes('拦空35✗'), JSON.stringify(m));
+  assert.ok(!m.some((t) => /70/.test(t)), '其他币的信号不应出现');
+  const lines = await page.evaluate(() => (window.__focusLines || []).map((l) => l.options().title));
+  assert.deepEqual(lines, ['信号入场', '信号止损', '信号目标']);
+  await page.click('#sigMarkToggle');
+  assert.equal(await page.evaluate(() => window.__sigMarkApi.markers().length), 0);
+  assert.equal(await page.evaluate(() => (window.__focusLines || []).length), 0);
+  assert.deepEqual(errors, []);
+});
+
+test('门控开关 + 评分版本：设置里关闭过热区立即生效；台账默认只统计当前版本，可切换到全部；随机基线表显示', { skip }, async () => {
+  const now = Date.now() - 6 * 3600e3;
+  const mk = (i, ver, hit) => ({ ts: now - i * 60e3, symbol: 'AUSDT', dir: i % 2 ? 'long' : 'short', score: i % 2 ? 66 : 30, price: 1, gated: true, gates: {}, resolved: true, ver,
+    r1h: { price: 1, pct: 0.1, hit }, r4h: { price: 1, pct: hit === (i % 2 === 1) ? 1 : -1, hit, btcPct: 0.2 } });
+  const recs = [].concat(Array.from({ length: 40 }, (_, i) => mk(i, '2', i % 3 !== 0)), Array.from({ length: 10 }, (_, i) => mk(100 + i, undefined, false)));
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)};`);
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => /信号 vs 随机基线/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 15000 });
+  // 启动时推荐扫描本身也会新增若干条当前版本的记录，所以期望值按页面里的实际记录数计算
+  await page.waitForFunction(() => {
+    const n = fwdRecords.filter((r) => r.ver === SCORING_VERSION).length;
+    return document.getElementById('fwdLedger').innerText.includes('共 ' + n + ' 条信号') && !document.getElementById('recommendRefreshNote');
+  }, null, { timeout: 30000 });
+  const cnt = await page.evaluate(() => ({ cur: fwdRecords.filter((r) => r.ver === SCORING_VERSION).length, all: fwdRecords.length }));
+  assert.ok(cnt.cur >= 40 && cnt.all === cnt.cur + 10);
+  let t = await page.locator('#fwdLedger').innerText();
+  assert.ok(t.includes('共 ' + cnt.cur + ' 条信号'), '默认只统计当前版本');
+  assert.match(t, /全部版本（含旧版 10 条）/);
+  assert.match(t, /相对 BTC 方向超额/);
+  await page.click('button:has-text("全部版本")');
+  t = await page.locator('#fwdLedger').innerText();
+  assert.ok(t.includes('共 ' + cnt.all + ' 条信号'));
+  // 设置：关闭过热区
+  await page.click(`[onclick="showView('settings')"], [data-onclick="showView('settings')"]`);
+  await page.waitForSelector('[data-gate="overheat"]');
+  await page.uncheck('[data-gate="overheat"]');
+  await page.waitForFunction(() => /已关闭 1 道门控/.test(document.getElementById('gateMsg').textContent));
+  assert.equal(await page.evaluate(() => gateCfg().overheat), false);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('novatrade_gates_v1')).overheat), false);
+  await page.uncheck('[data-gate="score39"]');
+  assert.equal(await page.evaluate(() => SHORT_SCORE_MIN), 45);
+  await page.click('button:has-text("全部恢复默认")');
+  assert.equal(await page.evaluate(() => SHORT_SCORE_MIN), 39);
+  assert.deepEqual(errors, []);
 });

@@ -615,7 +615,7 @@ function notifyNewSignals(buy, sell, quality) {
 function fwdDerivSplit() {
   var agree = [], disagree = [];
   fwdRecords.forEach(function (r) {
-    if (!r.r4h || typeof r.dv !== "number" || r.dv === 0) return;
+    if (!recInScope(r) || !r.r4h || typeof r.dv !== "number" || r.dv === 0) return;
     ((r.dir === "long") === (r.dv > 0) ? agree : disagree).push(r);
   });
   var rate = function (a) { return a.length ? a.filter(function (r) { return r.r4h.hit; }).length / a.length * 100 : null; };
@@ -633,33 +633,41 @@ function recordFwdSignals(analyses, skipShortSyms, skipLongSyms, sellGateDetail,
     // "原始空(<45 全记) vs 门控空(score<39 且过全部否决)" 并行前向验证，n≥30 后数据裁决
     // 1007 多头对称记账：过热区 [70,75) 过滤（裁决B）+ 日线 regime 门控，原始多(≥65 全记)继续留档
     // 1007b gates 细化：emaOK(EMA 交叉)/priceOK(收盘价破 EMA20) 分开记，前向验证可拆分两种放行口径的质量
+    // gates 记录的是「每道门控本来会不会拦」（与开关无关，供门控归因比较）；gated 只按当前开启的门控判定
+    const G = gateCfg();
+    const hits = a.gateHits || {};
     let gated = true, gates = null;
     if (dir === "short") {
       const det = (sellGateDetail || {})[a.symbol] || {};
       gates = {
-        score39: a.score < SHORT_SCORE_MIN,          // 门槛收紧 45→39
-        btcVeto: !!a.shortVeto,                       // BTC 偏多一票否决
-        nearSupVeto: !!a.nearSupportVeto,             // 距最近支撑 <1ATR 否决
-        stopCapVeto: !!a.stopCapVeto,                         // 1010：止损距离超上限否决
+        score39: a.score < SHORT_SCORE_STRICT,        // 评分门槛：score < 39
+        btcVeto: !!(a.btcHit || a.shortVeto),         // BTC 偏多一票否决
+        nearSupVeto: !!(hits.nearSup || a.nearSupportVeto),  // 距最近支撑 <1ATR
+        stopCapVeto: !!(hits.stopCap || a.stopCapVeto),      // 1010：止损距离超上限
         dailyOK: !(skipShortSyms && skipShortSyms.has(a.symbol)), // 日线门控（EMA死叉 或 价破EMA20）
         emaOK: det.emaOK, priceOK: det.priceOK        // 1007b：两种放行依据分记
       };
-      gated = gates.score39 && gates.dailyOK && !gates.btcVeto && !gates.nearSupVeto && !gates.stopCapVeto;
+      gated = (gates.score39 || !G.score39) && (gates.dailyOK || !G.daily) && !(gates.btcVeto && G.btcVeto) &&
+        !(gates.nearSupVeto && G.nearSup) && !(gates.stopCapVeto && G.stopCap);
     } else {
       const det = (buyGateDetail || {})[a.symbol] || {};
       gates = {
-        overheat: a.score >= OVERHEAT_MIN && a.score < OVERHEAT_MAX, // 70-74 过热区过滤
-        stopCapVeto: !!a.stopCapVeto,                                         // 1010：止损距离超上限否决
+        overheat: a.score >= OVERHEAT_MIN && a.score < OVERHEAT_MAX, // 70-74 过热区
+        stopCapVeto: !!(hits.stopCap || a.stopCapVeto),               // 1010：止损距离超上限
         dailyOK: !(skipLongSyms && skipLongSyms.has(a.symbol)),       // 日线门控（EMA金叉 或 价在EMA20上）
         emaOK: det.emaOK, priceOK: det.priceOK
       };
-      gated = !gates.overheat && gates.dailyOK && !gates.stopCapVeto;
+      gated = !(gates.overheat && G.overheat) && (gates.dailyOK || !G.daily) && !(gates.stopCapVeto && G.stopCap);
     }
     // 去重：同币同方向 4 小时内已有未结算记录则不重复
     const dup = fwdRecords.some(r => !r.resolved && r.symbol === a.symbol && r.dir === dir && now - r.ts < FWD_4H);
     if (dup) continue;
     const rec = { ts: now, symbol: a.symbol, dir: dir, score: Math.round(a.score), price: a.price, r1h: null, r4h: null, resolved: false };
     rec.gated = gated; rec.gates = gates;
+    rec.ver = SCORING_VERSION;
+    rec.gcfg = Object.keys(G).filter(function (k) { return G[k]; }).join(",");   // 当时开启了哪些门控
+    if (a.riskReward) { rec.sl = a.riskReward.stopLoss; rec.tp = a.riskReward.tps && a.riskReward.tps[0] ? a.riskReward.tps[0].price : a.riskReward.takeProfit; }
+    rec.btc = (allPrices && allPrices.BTCUSDT) || null;   // BTC 同期价格，结算时用来算相对 BTC 的超额收益
     rec.feat = a.feat || null;                         // 影子模型的训练特征（见 lib/shadow-model.js）
     rec.dv = a.dv ? a.dv.s : null;                     // 衍生品倾向（未经验证，仅用于事后对比）
     fwdRecords.push(rec);
@@ -694,6 +702,7 @@ async function resolveFwdSignals() {
   if (!fwdLoaded) return;
   const now = Date.now();
   let changed = false;
+  const btcAt = {};
   // 迁移修复：旧记录 1h/4h 曾同刻结算（App 离线所致），用 K 线回填真实 1h 价
   for (const r of fwdRecords.filter(r => r.resolved && r.r1h && r.r4h && r.r1h.price === r.r4h.price && !r.r1h.backfilled)) {
     try {
@@ -719,6 +728,12 @@ async function resolveFwdSignals() {
           const pct = (px / r.price - 1) * 100;
           const hit = r.dir === "long" ? px > r.price : px < r.price;
           r[key] = { price: px, pct: +pct.toFixed(3), hit: hit };
+          // 同一时刻的 BTC 价格（同一批信号的结算时刻相同，按 5 分钟取整缓存，避免重复请求）
+          if (r.btc > 0) {
+            const bk = Math.floor(targetTs / 300e3);
+            if (!(bk in btcAt)) { try { btcAt[bk] = await fwdPriceAt("BTCUSDT", targetTs); } catch (e) { btcAt[bk] = null; } }
+            if (btcAt[bk] > 0) r[key].btcPct = +((btcAt[bk] / r.btc - 1) * 100).toFixed(3);
+          }
           changed = true;
         }
       } catch(e) {}
@@ -731,7 +746,8 @@ async function resolveFwdSignals() {
 
 function fwdStatsCalc() {
   const calc = (key) => {
-    const rs = fwdRecords.filter(r => r[key] !== null);
+    // 只统计真正结算过的（导入的备份 / 旧数据里可能缺字段，不能让统计把整个推荐页带崩）
+    const rs = fwdRecords.filter(r => recInScope(r) && r[key] && typeof r[key].hit === "boolean" && isFinite(r[key].pct));
     if (rs.length === 0) return { n: 0, hitRate: null, avgPct: null };
     const longs = rs.filter(r => r.dir === "long");
     const shorts = rs.filter(r => r.dir === "short");
@@ -742,7 +758,7 @@ function fwdStatsCalc() {
       avgPct: rs.reduce((s, r) => s + r[key].pct * (r.dir === "long" ? 1 : -1), 0) / rs.length
     };
   };
-  return { h1: calc("r1h"), h4: calc("r4h"), pending: fwdRecords.filter(r => !r.resolved).length };
+  return { h1: calc("r1h"), h4: calc("r4h"), pending: fwdRecords.filter(r => recInScope(r) && !r.resolved).length };
 }
 
 function fwdQualityStatus() {
@@ -2074,13 +2090,18 @@ const LEDGER_FILTERS = [
 ];
 function ledgerFiltersHtml() {
   const f = window.__ledgerFilter;
+  const sc = ledgerScope();
+  const old = (fwdRecords || []).filter(function (r) { return r && r.ver !== SCORING_VERSION; }).length;
   return "<div class=\"ledger-filters\">" + LEDGER_FILTERS.map(function (x) {
     return "<button class=\"filter-btn" + (f === x[0] ? " active" : "") + "\" data-ledger=\"" + x[0] + "\" onclick=\"setLedgerFilter('" + x[0] + "')\">" + x[1] + "</button>";
-  }).join("") + "</div>";
+  }).join("") +
+    "<span class=\"fa-dim\" style=\"margin-left:auto\">统计口径：</span>" +
+    "<button class=\"filter-btn" + (sc === "current" ? " active" : "") + "\" onclick=\"setLedgerScope('current')\">当前评分版本 v" + SCORING_VERSION + "</button>" +
+    "<button class=\"filter-btn" + (sc === "all" ? " active" : "") + "\" onclick=\"setLedgerScope('all')\">全部版本" + (old ? "（含旧版 " + old + " 条）" : "") + "</button></div>";
 }
 function ledgerRows() {
   const f = window.__ledgerFilter;
-  let rs = (fwdRecords || []).slice();
+  let rs = (fwdRecords || []).filter(recInScope);
   if (f === "long") rs = rs.filter(r => r.dir === "long");
   else if (f === "short") rs = rs.filter(r => r.dir === "short");
   else if (f === "settled") rs = rs.filter(r => r.r4h);
@@ -2097,9 +2118,40 @@ function ledgerCell(res, dir, expired) {
   return "<span class=\"" + cls + "\">" + (res.hit ? "命中" : "未中") + " " + (signed >= 0 ? "+" : "") + signed.toFixed(2) + "%</span>";
 }
 // 门控归因：每道门控拦下的信号，事后 4h 方向命中率是否真的比放行的差（见 lib/fwd-attribution.js）
+// 统计口径：当前评分版本 / 全部版本（见第 3 项「评分版本标记」）
+var LEDGER_SCOPE_KEY = "novatrade_ledger_scope";
+function ledgerScope() { try { return localStorage.getItem(LEDGER_SCOPE_KEY) === "all" ? "all" : "current"; } catch (e) { return "current"; } }
+function setLedgerScope(v) { try { localStorage.setItem(LEDGER_SCOPE_KEY, v === "all" ? "all" : "current"); } catch (e) {} renderFwdStats(); }
+window.setLedgerScope = setLedgerScope;
+// 默认只统计当前评分版本：旧版本的评分逻辑不同（见 SCORING_VERSION 注释），混在一起会污染命中率与门控归因
+function recInScope(r) { return !!r && (ledgerScope() === "all" || r.ver === SCORING_VERSION); }
+// 信号 vs 随机基线（见 lib/fwd-attribution.js 的 faBaseline）
+function baselineHtml() {
+  if (typeof faBaseline !== "function") return "";
+  var all = (fwdRecords || []).filter(function (r) { return recInScope(r); });
+  var rows = [["放行的信号", faBaseline(all, { onlyPassed: true, rng: faRng(7) })], ["全部记录（含被拦截）", faBaseline(all, { rng: faRng(11) })]];
+  if (!rows[1][1].n) return "";
+  var pct = function (v) { return v === null || v === undefined || !isFinite(v) ? "--" : v.toFixed(0) + "%"; };
+  var body = rows.map(function (x) {
+    var b = x[1];
+    if (!b.n) return '<tr><td>' + x[0] + '</td><td>0</td><td colspan="6" class="fa-dim">无记录</td></tr>';
+    var verdict = b.n < 30 ? '<span class="fa-dim">样本不足（需 ≥30）</span>'
+      : b.pValue < 0.05 ? '<span class="bt-tag ok">显著好于随机</span>'
+      : (b.hitRate < b.randLo ? '<span class="bt-tag bad">比随机还差</span>' : '<span class="bt-tag warn">与随机无显著差异</span>');
+    var ex = b.excessN ? '<span class="' + (b.excessAvg >= 0 ? "up" : "down") + '">' + (b.excessAvg >= 0 ? "+" : "") + b.excessAvg.toFixed(2) + '%</span> <span class="fa-dim">（跑赢 ' + pct(b.excessHit) + '，n=' + b.excessN + '）</span>' : '<span class="fa-dim">新记录才有</span>';
+    return '<tr><td>' + x[0] + '</td><td>' + b.n + '<span class="fa-dim">（多 ' + b.longN + ' / 空 ' + b.shortN + '）</span></td><td>' + pct(b.hitRate) + '</td>' +
+      '<td>' + pct(b.randMean) + ' <span class="fa-dim">（' + pct(b.randLo) + '–' + pct(b.randHi) + '）</span></td><td>' + b.pValue.toFixed(3) + '</td>' +
+      '<td>' + pct(b.allLongRate) + ' / ' + pct(b.allShortRate) + '</td><td>' + ex + '</td><td>' + verdict + '</td></tr>';
+  }).join("");
+  return '<div class="fa-wrap"><div class="mini-title">信号 vs 随机基线（4h）</div><div class="nt-wrap"><table class="nt"><thead><tr>' +
+    '<th>分组</th><th>笔数</th><th>实际命中</th><th>随机方向命中（95% 范围）</th><th>p 值</th><th>全做多 / 全做空</th><th>相对 BTC 方向超额</th><th>结论</th></tr></thead><tbody>' + body + '</tbody></table></div>' +
+    '<div class="size-note">「随机方向」：同一批币、同一时间点，保持多空笔数不变，把方向随机打乱 2000 次。实际命中率要明显高于这个范围（p&lt;0.05）才说明信号的方向判断有用。' +
+    '「全做多 / 全做空」反映这段时间的大盘漂移：如果实际命中率只是接近「全做多」，说明只是赶上了上涨行情。「相对 BTC 超额」把大盘涨跌扣掉，只看选币本身。</div></div>';
+}
+window.baselineHtml = baselineHtml;
 function gateAttributionHtml() {
   if (typeof faAttribution !== "function") return "";
-  var A = faAttribution(fwdRecords || []);
+  var A = faAttribution((fwdRecords || []).filter(recInScope));
   if (!A.total) return "";
   var pct = function (v) { return v === null || v === undefined || !isFinite(v) ? "--" : v.toFixed(0) + "%"; };
   var ci = function (s) { return s && s.h4Ci ? '<span class="fa-dim">（' + s.h4Ci.lo.toFixed(0) + "–" + s.h4Ci.hi.toFixed(0) + "）</span>" : ""; };
@@ -2134,11 +2186,11 @@ function renderFwdLedger() {
   const box = document.getElementById("fwdLedger");
   if (!box) return;
   if (!fwdLoaded) { box.innerHTML = "<div class=\"linked-empty\">台账加载中...</div>"; return; }
-  const all = fwdRecords || [];
+  const all = (fwdRecords || []).filter(recInScope);
   const rs = ledgerRows();
   const settled = all.filter(r => r.r4h).length;
   const expiredN = all.filter(r => r.expired && !r.r4h).length;
-  const head = gateAttributionHtml() + ledgerFiltersHtml() +
+  const head = baselineHtml() + gateAttributionHtml() + ledgerFiltersHtml() +
     "<div class=\"vp-note\" style=\"margin-bottom:10px\">共 " + all.length + " 条信号（已结算 " + settled + "，待结算 " + (all.length - settled - expiredN) + (expiredN ? "，无数据 " + expiredN : "") + "）；" +
     "「被门控拦下的」= 记录了但当时风控门控没放行，用来对比“记了但没做”的口径质量。点任意一行可回到该币技术分析。</div>";
   if (rs.length === 0) { box.innerHTML = head + "<div class=\"linked-empty\">该筛选下暂无记录。</div>"; return; }
@@ -2146,7 +2198,7 @@ function renderFwdLedger() {
     const t = new Date(r.ts || Date.now()).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
     const isLong = r.dir === "long";
     const gate = r.gated === false ? "<em class=\"sc-tag down\">已拦截</em>" : "<em class=\"sc-tag up\">放行</em>";
-    return "<div class=\"ledger-tr clickable\" onclick=\"openLinkedCoin('" + escapeJsAttr(r.symbol) + "')\">" +
+    return "<div class=\"ledger-tr clickable\" title=\"打开该币并在 K 线上标出这条信号\" onclick=\"openLedgerSignal('" + escapeJsAttr(r.symbol) + "'," + Number(r.ts) + ")\">" +
       "<span class=\"ledger-td\">" + t + "</span>" +
       "<span class=\"ledger-td sym\">" + escapeHtml(splitSymbol(r.symbol).base) + "</span>" +
       "<span class=\"ledger-td\">" + (isLong ? "多" : "空") + "</span>" +
@@ -3164,15 +3216,22 @@ async function renderRecommendations() { const grid = document.getElementById("r
         const merged = { ...co, ...a };
         analyses.push(merged);
         // 1007 过热区计数 + 双向门控（与收尾 recordFwdSignals 完全同源）
-        if (merged.score >= OVERHEAT_MIN && merged.score < OVERHEAT_MAX) overheatCount++;
-        if (merged.score >= SIGNAL_LONG_MIN && !(merged.score >= OVERHEAT_MIN && merged.score < OVERHEAT_MAX)) {
+        const G = gateCfg();
+        const inOverheat = merged.score >= OVERHEAT_MIN && merged.score < OVERHEAT_MAX;
+        if (inOverheat && G.overheat) overheatCount++;
+        // gatedBuySet / gatedSellSet 记录「日线门控本来会不会拦」（供台账归因）；门控关闭时仍放入推荐池
+        if (merged.score >= SIGNAL_LONG_MIN && !(inOverheat && G.overheat)) {
           try { const d = await candidateDailyTrend(merged); buyGateDetail[merged.symbol] = { emaOK: d.up, priceOK: d.above20 };
-            if (d.up || d.above20) buyPool.push(merged); else { gatedBuySet.add(merged.symbol); blockedBuy++; } }
+            const ok = d.up || d.above20;
+            if (!ok) gatedBuySet.add(merged.symbol);
+            if (ok || !G.daily) buyPool.push(merged); else blockedBuy++; }
           catch (e) { buyPool.push(merged); }
         }
         if (merged.score < SHORT_SCORE_MIN) {
           try { const d = await candidateDailyTrend(merged); sellGateDetail[merged.symbol] = { emaOK: d.down, priceOK: d.below20 };
-            if (d.down || d.below20) sellPool.push(merged); else { gatedSellSet.add(merged.symbol); blockedSell++; } }
+            const ok = d.down || d.below20;
+            if (!ok) gatedSellSet.add(merged.symbol);
+            if (ok || !G.daily) sellPool.push(merged); else blockedSell++; }
           catch (e) { sellPool.push(merged); }
         }
         progressiveRender();
@@ -3589,6 +3648,62 @@ try { if (typeof document !== "undefined" && document.getElementById) applyNotif
 // 沙箱里 document.documentElement / localStorage 均不存在，原 catch 回退也会二次抛错 ⇒ 整个脚本加载失败。
 try { if (typeof document !== "undefined" && document.documentElement) applyDensity(localStorage.getItem(DENSITY_KEY) || "comfortable", false); } catch (e) {}
 
+// ===== K 线图上的历史信号标注（见 lib/signal-marks.js）=====
+var SIG_MARK_KEY = "novatrade_show_sigmarks";
+function signalMarksOn() { try { return localStorage.getItem(SIG_MARK_KEY) !== "0"; } catch (e) { return true; } }
+function paintSignalToggle() {
+  var b = document.getElementById("sigMarkToggle");
+  if (b) { b.classList.toggle("active", signalMarksOn()); b.textContent = signalMarksOn() ? "信号标注 ✓" : "信号标注"; }
+}
+function toggleSignalMarks() {
+  try { localStorage.setItem(SIG_MARK_KEY, signalMarksOn() ? "0" : "1"); } catch (e) {}
+  applySignalMarks();
+}
+window.toggleSignalMarks = toggleSignalMarks;
+function clearFocusLines(series) {
+  (window.__focusLines || []).forEach(function (l) { try { series.removePriceLine(l); } catch (e) {} });
+  window.__focusLines = [];
+}
+function applySignalMarks() {
+  paintSignalToggle();
+  var series = window.__priceChartSeries && window.__priceChartSeries.candle;
+  if (!series || typeof LightweightCharts === "undefined" || !LightweightCharts.createSeriesMarkers) return;
+  var sym = selectedCoin ? (selectedCoin.endsWith("USDT") ? selectedCoin : selectedCoin + "USDT") : "";
+  var data = [];
+  try { data = series.data() || []; } catch (e) { data = []; }
+  var times = data.map(function (d) { return d.time; });
+  var focus = window.__focusSignal && window.__focusSignal.symbol === sym ? window.__focusSignal : null;
+  var marks = [];
+  if (signalMarksOn()) {
+    var PAL = chartPalette();
+    var tracks = [];
+    try { tracks = loadLinkedState().tracks || []; } catch (e) {}
+    marks = sgMarks(fwdRecords || [], tracks, times, { symbol: sym, focusTs: focus ? focus.ts : null, colors: { up: PAL.up, down: PAL.down, neutral: "#9ca3af", accent: PAL.accent } });
+  }
+  try {
+    if (!window.__sigMarkApi) window.__sigMarkApi = LightweightCharts.createSeriesMarkers(series, marks);
+    else window.__sigMarkApi.setMarkers(marks);
+  } catch (e) { console.warn("[app] signal marks:", e && e.message); }
+  // 从信号台账点进来：在图上画出该信号的入场 / 止损 / 目标价
+  clearFocusLines(series);
+  if (focus && signalMarksOn()) {
+    var r = (fwdRecords || []).find(function (x) { return x.ts === focus.ts && x.symbol === sym; });
+    if (r) {
+      var LS = LightweightCharts.LineStyle;
+      var add = function (price, color, title) { if (isFinite(price) && price > 0) { try { window.__focusLines.push(series.createPriceLine({ price: price, color: color, lineWidth: 1, lineStyle: LS.Dotted, axisLabelVisible: true, title: title })); } catch (e) {} } };
+      add(r.price, "#9ca3af", "信号入场");
+      add(r.sl, "#ef4444", "信号止损");
+      add(r.tp, "#22c55e", "信号目标");
+    }
+  }
+}
+window.applySignalMarks = applySignalMarks;
+function openLedgerSignal(symbol, ts) {
+  window.__focusSignal = { symbol: symbol, ts: ts };
+  try { localStorage.setItem(SIG_MARK_KEY, "1"); } catch (e) {}
+  openLinkedCoin(symbol);
+}
+window.openLedgerSignal = openLedgerSignal;
 function initChart(klines) {
   var container = document.getElementById("tvChart");
   if (!container) { console.error("[app] tvChart not found"); return; }
@@ -3707,7 +3822,10 @@ function initChart(klines) {
       else if (el.id === "adxChart" && adxChart) adxChart.applyOptions({width:nw,height:nh});
     }
   });
-  window.__priceChartSeries = { candle: cs, vol: null, ma7: null, ma25: null };
+  // 只补上主 K 线引用；之前这里整体重置成 { vol:null, ma7:null, ma25:null }，导致成交量与均线在首次绘制后再也不更新
+  window.__priceChartSeries.candle = cs;
+  window.__sigMarkApi = null;
+  applySignalMarks();
   window.__chartRO.observe(container);
   ["macdChart","rsiChart","adxChart"].forEach(function(id){var e=document.getElementById(id);if(e)window.__chartRO.observe(e);});
   console.log("[app] initChart done");
@@ -3790,6 +3908,7 @@ function updateChart(klines) {
       adxChart.__series.ref.setData(candleData.map(function(d){return{time:d.time,value:25};}));
     }
   }catch(e){}
+  applySignalMarks();
   setTimeout(function(){if(priceChart)priceChart.timeScale().fitContent();},50);
 }
 function setupFilters(klines) {

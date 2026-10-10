@@ -7,7 +7,7 @@ const path = require("path");
 const vm = require("vm");
 
 const RENDERER = path.resolve(__dirname, "..", "renderer");
-const LIB_ORDER = ["lib/indicators.js", "lib/analysis-core.js", "lib/scoring.js", "lib/backtest-core.js", "lib/alerts-core.js", "lib/realtime.js", "lib/shadow-model.js", "lib/portfolio-risk.js", "lib/fwd-attribution.js"];
+const LIB_ORDER = ["lib/indicators.js", "lib/analysis-core.js", "lib/scoring.js", "lib/backtest-core.js", "lib/alerts-core.js", "lib/realtime.js", "lib/shadow-model.js", "lib/portfolio-risk.js", "lib/fwd-attribution.js", "lib/signal-marks.js"];
 
 function createStorage() {
   const m = new Map();
