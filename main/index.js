@@ -793,6 +793,18 @@ function getLlm() {
   if (!llmSvc) llmSvc = createLlm({ safeStorage, file: path.join(app.getPath('userData'), 'llm_config.json'), getAgent: agentForUse, log });
   return llmSvc;
 }
+const { createAccount } = require('./binance-account');
+let acctSvc = null;
+function getAccount() {
+  if (!acctSvc) acctSvc = createAccount({ safeStorage, file: path.join(app.getPath('userData'), 'account_key.json'), http: binanceHttp, agent: () => agentFor(spotProxy || futuresProxy), log });
+  return acctSvc;
+}
+ipcHandle('account:getConfig', () => getAccount().getPublicConfig());
+ipcHandle('account:setKey', (e, key, secret) => getAccount().setKey(typeof key === 'string' ? key : '', typeof secret === 'string' ? secret : ''));
+ipcHandle('account:import', (e, opts) => getAccount().importTrades({
+  spotSymbols: opts && Array.isArray(opts.spotSymbols) ? opts.spotSymbols.map(V.symbol).filter(Boolean) : [],
+  futures: !(opts && opts.futures === false)
+}));
 ipcHandle('push:getConfig', () => getPush().getPublicConfig());
 ipcHandle('push:setConfig', (e, cfg) => getPush().setConfig(cfg));
 ipcHandle('push:send', (e, msg) => { getPush().send(msg).catch((err) => log('[main] push error:', err.message)); return true; });   // 即发即忘

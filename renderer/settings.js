@@ -108,9 +108,37 @@
       '<div id="llmMsg" class="set-result"></div></div>';
   }
 
+  function accountCardHtml() {
+    var c = S.account || {};
+    return '<div class="set-card"><h3>交易所只读 API（导入真实成交）</h3>' +
+      '<div class="set-note">用于「持仓与复盘 → 真实成交」从币安导入你的成交记录。<b>只接受仅读取权限的 Key</b>：保存前会向币安查询该 Key 的权限，' +
+      '只要开了交易、杠杆、合约、期权、提现或划转中的任何一项就拒绝保存。Key 与 Secret 用系统安全存储加密，界面只显示尾号。' +
+      '建议在币安为这个 Key 绑定 IP 白名单。不想配置 Key 的话，也可以直接在「真实成交」里导入币安导出的 CSV。</div>' +
+      (c.configured ? '<div class="set-note">已配置：' + esc(c.apiKey) + (c.perms ? (c.perms.ipRestrict ? " · 已绑定 IP 白名单" : " · 未绑定 IP 白名单") : "") + '</div>' : "") +
+      '<div class="set-row"><label>API Key<input type="text" id="acct_key" autocomplete="off" placeholder="' + (c.configured ? "重新填写可替换" : "") + '"></label>' +
+      '<label>Secret Key<input type="password" id="acct_secret" autocomplete="off"></label>' +
+      '<button class="btn-primary" onclick="accountSave()"' + (c.canStore === false ? " disabled" : "") + '>验证并保存</button>' +
+      (c.configured ? '<button class="btn-ghost" onclick="accountClear()">删除</button>' : "") + '</div>' +
+      '<div id="acctMsg" class="set-result"></div></div>';
+  }
+  window.accountSave = async function () {
+    var a = api();
+    if (!a.accountSetKey) return;
+    setBusy("acctMsg", "正在向币安查询该 Key 的权限……");
+    var r = await a.accountSetKey(($("acct_key") || {}).value, ($("acct_secret") || {}).value);
+    if (r && r.ok) { S.account = r.config; renderSettings(); toast("只读 API Key 已保存"); }
+    else msg("acctMsg", (r && (r.error || r.__error)) || "保存失败", false);
+  };
+  window.accountClear = async function () {
+    var a = api();
+    if (!a.accountSetKey || !window.confirm("删除已保存的只读 API Key？")) return;
+    var r = await a.accountSetKey("", "");
+    if (r && r.ok) { S.account = r.config; renderSettings(); }
+  };
+
   function dataCardHtml() {
     return '<div class="set-card"><h3>数据与备份</h3>' +
-      '<div class="set-note">备份包含：自选、价格预警、持仓、交易日志、各类设置，以及信号前向验证记录。<b>不包含</b>推送令牌与 API Key（它们由系统安全存储保护，不会写进备份文件）。导入会覆盖同名的本地数据，并重新加载页面。</div>' +
+      '<div class="set-note">备份包含：自选、价格预警、持仓、交易日志、已导入的真实成交、各类设置，以及信号前向验证记录。<b>不包含</b>推送令牌、AI 接口密钥与交易所 API Key（它们由系统安全存储保护，不会写进备份文件）。导入会覆盖同名的本地数据，并重新加载页面。</div>' +
       '<div class="set-row"><button class="btn-ghost" onclick="backupExport()">导出备份</button><button class="btn-ghost" onclick="backupImport()">导入备份</button></div>' +
       '<div id="backupMsg" class="set-result"></div></div>';
   }
@@ -137,8 +165,9 @@
     try {
       if (a.pushGetConfig) { var pc = await a.pushGetConfig(); if (pc && pc.channels) { S.channels = pc.channels; S.canStore = pc.canStore !== false; } }
       if (a.llmGetConfig) S.llm = await a.llmGetConfig();
+      if (a.accountGetConfig) S.account = await a.accountGetConfig();
     } catch (e) { console.warn("[settings] load failed:", e && e.message); }
-    root.innerHTML = pushCardHtml() + generalCardHtml() + gateCardHtml() + llmCardHtml() + dataCardHtml() + aboutCardHtml() + disclaimerHtml();
+    root.innerHTML = pushCardHtml() + generalCardHtml() + gateCardHtml() + llmCardHtml() + accountCardHtml() + dataCardHtml() + aboutCardHtml() + disclaimerHtml();
     try {
       var info = a.appInfo ? await a.appInfo() : null;
       var ds = window.__dataSource;

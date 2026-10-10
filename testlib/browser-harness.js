@@ -110,6 +110,21 @@ const MOCK_SCRIPT = `
         if (!window.__llmCfg.configured) return { ok: false, error: '尚未配置 AI 接口（设置 → AI 解读）' };
         return { ok: true, text: '结构偏多。\\n矛盾点：15m 动能转弱。\\n以上为基于所给数据的技术解读，不构成投资建议。', model: window.__llmCfg.model };
       };
+      if (name === 'accountGetConfig') return async function () { return window.__acctCfg || { canStore: true, configured: false }; };
+      if (name === 'accountSetKey') return async function (k, sec) {
+        rec('accountSetKey', [k ? 'k' : '', sec ? 's' : '']);
+        if (k === 'TRADEKEY'.repeat(5)) return { ok: false, error: '为安全起见只接受只读 Key：请在币安关闭该 Key 的「现货与杠杆交易」权限后再试' };
+        window.__acctCfg = k ? { canStore: true, configured: true, apiKey: '••••' + k.slice(-4), perms: { enableReading: true, ipRestrict: false } } : { canStore: true, configured: false };
+        return { ok: true, config: window.__acctCfg };
+      };
+      if (name === 'accountImport') return async function (o) {
+        rec('accountImport', [o]);
+        var t0 = Date.now() - 3 * 3600e3;
+        return { ok: true, warnings: ['合约成交无法通过只读 Key 读取（币安要求开启合约权限，本应用不接受）。请在币安导出合约成交历史 CSV 后用「导入 CSV」。'], fills: [
+          { id: 'spot:SOLUSDT:1', ts: t0, symbol: 'SOLUSDT', market: 'spot', side: 'BUY', price: 100, qty: 2, quote: 200, fee: 0.2, feeAsset: 'USDT', realizedPnl: null, positionSide: 'BOTH' },
+          { id: 'spot:SOLUSDT:2', ts: t0 + 3600e3, symbol: 'SOLUSDT', market: 'spot', side: 'SELL', price: 104, qty: 2, quote: 208, fee: 0.2, feeAsset: 'USDT', realizedPnl: null, positionSide: 'BOTH' }
+        ] };
+      };
       if (name === 'appInfo') return async function () { return { version: '1.2.0', packaged: false, platform: 'linux', softwareRendering: false }; };
       if (name === 'checkUpdate') return async function () { return { ok: true, newer: true, latest: '9.9.9', current: '1.2.0' }; };
       if (name === 'backupExport') return async function (json, nm) { window.__saved.push({ json: json, name: nm }); return { ok: true, path: '/tmp/' + nm }; };

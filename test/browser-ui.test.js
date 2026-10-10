@@ -454,3 +454,50 @@ test('市场雷达：推送数据进入异动榜并触发异动提醒；资金�
   await page.evaluate(() => localStorage.removeItem('novatrade_radar_cfg'));
   assert.deepEqual(errors, []);
 });
+
+test('真实成交：只读 Key 保存（有交易权限的被拒）、API 导入、CSV 导入、按信号对照、写入交易日志', { skip }, async () => {
+  const t0 = Date.now() - 3 * 3600e3;
+  // 一条 SOL 同方向信号（开仓前 1 小时）→ API 导入的那笔 SOL 现货交易应标为「按信号做」
+  const recs = [{ ts: t0 - 3600e3, symbol: 'SOLUSDT', dir: 'long', score: 71, price: 99, gated: true, gates: {}, ver: '2' }];
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.removeItem('novatrade_fills_v1'); localStorage.removeItem('novatrade_journal_v1');`);
+  page.on('dialog', (d) => d.accept());
+  // 设置：有交易权限的 Key 被拒绝；只读 Key 保存后只显示尾号
+  await page.click(`[onclick="showView('settings')"], [data-onclick="showView('settings')"]`);
+  await page.fill('#acct_key', 'TRADEKEY'.repeat(5));
+  await page.fill('#acct_secret', 'S'.repeat(40));
+  await page.click('button:has-text("验证并保存")');
+  await page.waitForFunction(() => /只接受只读 Key/.test(document.getElementById('acctMsg').textContent));
+  await page.fill('#acct_key', 'A'.repeat(36) + 'WXYZ');
+  await page.fill('#acct_secret', 'S'.repeat(40));
+  await page.click('button:has-text("验证并保存")');
+  await page.waitForFunction(() => /已配置：••••WXYZ/.test(document.getElementById('settingsWrap').innerText));
+  // API 导入
+  await page.click(`[onclick="showView('mine')"], [data-onclick="showView('mine')"]`);
+  await page.click(`[onclick="switchMinePane('m_fills')"], [data-onclick="switchMinePane('m_fills')"]`);
+  await page.click('button:has-text("从只读 API 导入")');
+  await page.waitForFunction(() => /新增 2 笔成交/.test(document.getElementById('fillsMsg').textContent));
+  assert.match(await page.locator('#fillsMsg').innerText(), /导入 CSV/, '合约读不了时提示改用 CSV');
+  let t = await page.locator('#fillsWrap').innerText();
+  assert.match(t, /还原出 1 笔完整交易/);
+  assert.match(t, /按信号做 \(71分\)/);
+  // CSV 导入（合约做空一笔）
+  const csv = 'Date(UTC),Symbol,Side,Price,Quantity,Amount,Fee,Realized Profit\n' +
+    new Date(t0).toISOString().slice(0, 19).replace('T', ' ') + ',ETHUSDT,SELL,2000,1,2000,0.8USDT,0\n' +
+    new Date(t0 + 7200e3).toISOString().slice(0, 19).replace('T', ' ') + ',ETHUSDT,BUY,1900,1,1900,0.76USDT,100\n';
+  await page.setInputFiles('#fillsWrap input[type=file]', { name: 'trades.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await page.waitForFunction(() => /还原出 2 笔完整交易/.test(document.getElementById('fillsWrap').innerText));
+  t = await page.locator('#fillsWrap').innerText();
+  assert.match(t, /ETH 合约/);
+  assert.match(t, /\+98\.44/, '合约空单盈亏 = 100 − 手续费 1.56');
+  // 重复导入不会重复计数
+  await page.setInputFiles('#fillsWrap input[type=file]', { name: 'trades.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await page.waitForFunction(() => /新增 0 笔成交/.test(document.getElementById('fillsMsg').textContent));
+  // 写入交易日志（再写一次不会重复）
+  await page.click('button:has-text("写入交易日志")');
+  await page.waitForFunction(() => /已写入 2 笔/.test(document.getElementById('fillsMsg').textContent));
+  await page.click('button:has-text("写入交易日志")');
+  await page.waitForFunction(() => /没有新的完整交易/.test(document.getElementById('fillsMsg').textContent));
+  const jr = await page.evaluate(() => loadJournal().map((j) => j.symbol + ':' + j.src).sort());
+  assert.deepEqual(jr, ['ETHUSDT:manual', 'SOLUSDT:signal']);
+  assert.deepEqual(errors, []);
+});

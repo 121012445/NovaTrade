@@ -1223,13 +1223,15 @@ tr.clickable:hover td, .sr-row.clickable:hover { background: var(--bg-primary); 
       <div id="alertListWrap"></div>
     </div></section>
     <section id="view-mine" class="view"><div class="container">
-      <div class="mine-notice">这里是<b>本地记账本</b>，不是交易界面：把你自己真实做过的单子手动记进来做复盘对照。<b>不连接任何交易所账户、不能下单、不会自动交易</b>，数据只存在你这台电脑上。</div>
+      <div class="mine-notice">这里是<b>本地记账本</b>，不是交易界面：把你自己真实做过的单子记进来做复盘对照。<b>不能下单、不会自动交易</b>；「真实成交」可选用<b>仅读取权限</b>的 API Key 导入成交记录，数据只存在你这台电脑上。</div>
       <div class="ana-tabs" id="mineTabs">
         <button class="ana-tab active" data-mpane="m_port" onclick="switchMinePane('m_port')">组合持仓</button>
         <button class="ana-tab" data-mpane="m_journal" onclick="switchMinePane('m_journal')">交易日志</button>
+        <button class="ana-tab" data-mpane="m_fills" onclick="switchMinePane('m_fills')">真实成交</button>
       </div>
       <div class="ana-pane active" id="m_port"><div id="portWrap"></div></div>
       <div class="ana-pane" id="m_journal"><div id="journalWrap"></div></div>
+      <div class="ana-pane" id="m_fills"><div id="fillsWrap"></div></div>
     </div></section>
     <section id="view-radar" class="view"><div class="container"><div id="radarWrap"></div></div></section>
     <section id="view-settings" class="view"><div class="container">
@@ -1255,9 +1257,11 @@ tr.clickable:hover td, .sr-row.clickable:hover { background: var(--bg-primary); 
   <script src="lib/signal-marks.js"></script>
   <script src="lib/paper-track.js"></script>
   <script src="lib/radar.js"></script>
+  <script src="lib/fills.js"></script>
   <script src="lib/inline-handlers.js"></script>
   <script src="app.js"></script>
   <script src="settings.js"></script>
   <script src="radar.js"></script>
+  <script src="fills-view.js"></script>
 
 </html>

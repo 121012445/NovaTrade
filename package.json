@@ -31,6 +31,7 @@
       "renderer/app.js",
       "renderer/settings.js",
       "renderer/radar.js",
+      "renderer/fills-view.js",
       "renderer/lib/*.js",
       "renderer/widget.html",
       "renderer/widget.js",

@@ -5403,13 +5403,13 @@ function jrHtml() {
 
 // ========== 我的交易：页签路由 ==========
 function switchMinePane(pane) {
-  if (pane !== "m_journal") pane = "m_port";
+  if (pane !== "m_journal" && pane !== "m_fills") pane = "m_port";
   window.__minePane = pane;
   try {
     document.querySelectorAll("#mineTabs .ana-tab").forEach(function (b) {
       b.classList.toggle("active", b.dataset.mpane === pane);
     });
-    ["m_port", "m_journal"].forEach(function (id) {
+    ["m_port", "m_journal", "m_fills"].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.classList.toggle("active", id === pane);
     });
@@ -5425,6 +5425,7 @@ function renderMine() {
     var jw = document.getElementById("journalWrap");
     if (jw) jw.innerHTML = jrHtml();
   } catch (e) { console.error("[app] journal render:", e); }
+  try { if (window.renderFills) window.renderFills(); } catch (e) { console.error("[app] fills render:", e); }
 }
 window.switchMinePane = switchMinePane;
 window.renderMine = renderMine;
