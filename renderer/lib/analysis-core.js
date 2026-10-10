@@ -16,6 +16,31 @@ var SHORT_SCORE_MIN = 39; // 1006：空侧收紧门槛，score < 39 才允许做
 var OVERHEAT_MIN = 70;    // 1007：过热区下界（含）
 var OVERHEAT_MAX = 75;    // 1007：过热区上界（不含），[70,75) 为过热过滤区
 var MIN_ACTION_CONFIDENCE = 50; // 低于此值只展示方向观察，不给交易动作
+// 评分版本：评分 / 风险回报逻辑有实质变化时递增。信号台账按版本分开统计，避免新旧口径混在一起比较。
+//   v1（无标记）：旧版（含未收盘 K 线、MACD 信号线偏差、残留否决标记）
+//   v2：只用已收盘 K 线、修正 MACD、否决标记每次重算、门控可单独开关
+var SCORING_VERSION = "2";
+// 门控开关：默认全部开启（与原行为一致）。关闭某道门控后，信号不再因它被拦截，
+// 但台账仍记录「这道门控本来会不会拦」，以便门控归因表继续比较两组表现。
+var SHORT_SCORE_STRICT = 39;    // 空头评分门槛开启时的阈值（关闭后放宽到 SIGNAL_SHORT_MAX）
+var GATE_DEFAULTS = { overheat: true, daily: true, stopCap: true, score39: true, btcVeto: true, nearSup: true };
+var GATE_CFG_KEY = "novatrade_gates_v1";
+function gateCfg() { return (typeof window !== "undefined" && window.__gateCfg) || GATE_DEFAULTS; }
+function loadGateCfg() {
+  var c = {};
+  try { c = JSON.parse(localStorage.getItem(GATE_CFG_KEY) || "{}") || {}; } catch (e) { c = {}; }
+  var out = {};
+  Object.keys(GATE_DEFAULTS).forEach(function (k) { out[k] = typeof c[k] === "boolean" ? c[k] : GATE_DEFAULTS[k]; });
+  if (typeof window !== "undefined") window.__gateCfg = out;
+  SHORT_SCORE_MIN = out.score39 ? SHORT_SCORE_STRICT : SIGNAL_SHORT_MAX;
+  return out;
+}
+function saveGateCfg(cfg) {
+  var out = {};
+  Object.keys(GATE_DEFAULTS).forEach(function (k) { out[k] = cfg && typeof cfg[k] === "boolean" ? cfg[k] : GATE_DEFAULTS[k]; });
+  try { localStorage.setItem(GATE_CFG_KEY, JSON.stringify(out)); } catch (e) {}
+  return loadGateCfg();
+}
 var FWD_QUALITY_MIN_N = 30;     // 前向验证至少积累 30 条后才判断是否可行动
 var FWD_QUALITY_MIN_HIT = 50;   // 命中率低于随机基线时降级为仅观察
 // 1010 止损距离上限（2026-10-10 新增，依据 CHANGELOG §十一 的对照回测）：
@@ -267,6 +292,7 @@ function calcRiskReward(analysis, ohlc, livePrice) {
   // 否决标记每次都按「本次评分 + 本次数据」重新判定。多周期合并结果是从 4h 单周期结果复制来的，
   // 不先清除就会带着 4h 单独评分时的旧标记，把按合并评分本该放行的信号错误拦截。
   analysis.overheatVeto = false; analysis.nearSupportVeto = false; analysis.stopCapVeto = false;
+  analysis.gateHits = { overheat: false, nearSup: false, stopCap: false };
   if (!ohlc || ohlc.length < 20) return null;
   const last = ohlc[ohlc.length-1];
   // ohlc 为已收盘 K 线（结构位 / ATR 的来源）；livePrice 为此刻的最新价，缺省时退回最后一根收盘价。
@@ -286,36 +312,40 @@ function calcRiskReward(analysis, ohlc, livePrice) {
     atr = trs.slice(-atrPeriod).reduce((a,b)=>a+b,0) / atrPeriod;
   }
   atr = atr || price * 0.02;
-  let entry, stopLoss, direction;
   const supBelow = supports.map(s=>s.price).filter(p=>p<price);
   const resAbove = resistances.map(r=>r.price).filter(p=>p>price);
-  if (analysis.score >= SIGNAL_LONG_MIN) {
-    // 1007 过热区过滤（裁决B）：score∈[70,75) 前向验证 4h 命中率仅 14.29%（65-69 段为 40.00%），拒绝给出做多 TP/SL
-    if (analysis.score >= OVERHEAT_MIN && analysis.score < OVERHEAT_MAX) { analysis.overheatVeto = true; return null; }
-    direction = "long";
-    entry = price;
+  let direction;
+  if (analysis.score >= SIGNAL_LONG_MIN) direction = "long";
+  else if (analysis.score < SHORT_SCORE_MIN) direction = "short";
+  else return null;
+  const entry = price;
+  let stopLoss;
+  if (direction === "long") {
     // 止损挂在最近支撑下方 0.5ATR，距离限制在 1~2 倍 ATR，否则回退 1.5ATR
     stopLoss = supBelow.length ? Math.max(...supBelow) - atr*0.5 : price - atr*1.5;
     if (price - stopLoss < atr || price - stopLoss > atr*2) stopLoss = price - atr*1.5;
-  } else if (analysis.score < SHORT_SCORE_MIN) {
-    // 1006 做空门控②：BTC 明确偏多（ADX>25 且 score≥65）时空单一票否决 → 观望
-    if (analysis.shortVeto) return null;
-    // 1006 做空门控③：现价距最近支撑 <1ATR 不空（反弹最易发生在支撑位，入场即接飞刀）
-    if (supBelow.length) {
-      const __nearestSup = Math.max(...supBelow);
-      if (price - __nearestSup < atr) { analysis.nearSupportVeto = true; return null; }
-    }
-    direction = "short";
-    entry = price;
+  } else {
     stopLoss = resAbove.length ? Math.min(...resAbove) + atr*0.5 : price + atr*1.5;
     if (stopLoss - price < atr || stopLoss - price > atr*2) stopLoss = price + atr*1.5;
-  } else return null;
+  }
   const risk = Math.abs(entry - stopLoss);
   // 1010 止损距离上限：止损由 ATR 推导，而 ATR 无上限，极端波动币会给出 20%+ 的止损。
-  // 超过上限就直接否决这条信号（尾部风险护栏，见 CHANGELOG §十一 的对照回测）。
   const __stopCap = (typeof window !== "undefined" && typeof window.__maxStopPct === "number")
     ? window.__maxStopPct : MAX_STOP_PCT;
-  if (__stopCap > 0 && risk / entry * 100 > __stopCap) { analysis.stopCapVeto = true; return null; }
+  // 先独立判定每道门控「是否命中」（互不短路，供台账做门控归因），再按开关决定是否真的拦截
+  const hits = analysis.gateHits = {
+    // 1007 过热区：score∈[70,75) 不做多
+    overheat: direction === "long" && analysis.score >= OVERHEAT_MIN && analysis.score < OVERHEAT_MAX,
+    // 1006 做空门控③：现价距最近支撑 <1ATR 不空（反弹最易发生在支撑位）
+    nearSup: direction === "short" && supBelow.length > 0 && price - Math.max(...supBelow) < atr,
+    stopCap: __stopCap > 0 && risk / entry * 100 > __stopCap
+  };
+  const G = gateCfg();
+  if (hits.overheat && G.overheat) { analysis.overheatVeto = true; return null; }
+  // 1006 做空门控②：BTC 明确偏多时空单一票否决（shortVeto 由 applyBtcRegime 按开关设置）
+  if (direction === "short" && analysis.shortVeto) return null;
+  if (hits.nearSup && G.nearSup) { analysis.nearSupportVeto = true; return null; }
+  if (hits.stopCap && G.stopCap) { analysis.stopCapVeto = true; return null; }
   // 止盈三档：优先锚定真实结构位（跳过过近、挂不住的），结构位不足时才按 R 倍数补足
   const buf = atr * 0.25;
   const dirLong = direction === "long";
@@ -362,3 +392,6 @@ function detectPatternsEnhanced(ohlc) {
 // analyzeCoinEnhanced will be defined after analyzeCoin is loaded
 
 console.log("[app] Enhanced analysis module loaded");
+
+// 浏览器里启动时读取门控开关（Node 回测 / 测试环境下 localStorage 为空，即默认全开）
+try { if (typeof localStorage !== "undefined") loadGateCfg(); } catch (e) {}

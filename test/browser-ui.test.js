@@ -312,11 +312,192 @@ test('信号台账：门控归因表按方向显示放行 / 被拦截两组的�
   const p = { overheat: false, dailyOK: true, stopCapVeto: false };
   for (let i = 0; i < 30; i++) recs.push({ ts: now - i * 60e3, symbol: 'AUSDT', dir: 'long', score: 66, price: 1, gated: true, gates: p, resolved: true, r1h: { price: 1, pct: 0.1, hit: i < 10 }, r4h: { price: 1, pct: i < 9 ? 1 : -1, hit: i < 9 } });
   for (let i = 0; i < 30; i++) recs.push({ ts: now - i * 60e3, symbol: 'BUSDT', dir: 'long', score: 72, price: 1, gated: false, gates: g, resolved: true, r1h: { price: 1, pct: 0.1, hit: true }, r4h: { price: 1, pct: i < 25 ? 1 : -1, hit: i < 25 } });
-  const { page } = await open(`window.__fwdStore = ${JSON.stringify(recs)};`);
+  // 这些测试记录没有评分版本字段，切到「全部版本」口径
+  const { page } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.setItem('novatrade_ledger_scope', 'all');`);
   await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
   await page.waitForFunction(() => /门控归因/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 15000 });
-  const t = await page.locator('#fwdLedger .fa-wrap').innerText();
+  const t = await page.locator('#fwdLedger .fa-wrap:has-text("门控归因")').innerText();
   assert.match(t, /多头信号/);
   assert.match(t, /仅被「过热区（70–74 分不做多）」拦截/);
   assert.match(t, /拦下的反而更好/);
+});
+
+test('K 线信号标注：标出该币的历史信号；从台账点进来会画出入场 / 止损 / 目标线；可关闭', { skip }, async () => {
+  const H = 3600e3, base = Math.floor(Date.now() / H) * H;
+  const recs = [
+    { ts: base - 20 * H + 60e3, symbol: 'BTCUSDT', dir: 'long', score: 68, price: 100, sl: 95, tp: 110, gated: true, gates: {}, resolved: true, r1h: { hit: true, pct: 1 }, r4h: { hit: true, pct: 2 } },
+    { ts: base - 10 * H + 60e3, symbol: 'BTCUSDT', dir: 'short', score: 35, price: 105, gated: false, gates: {}, resolved: true, r1h: { hit: false, pct: 1 }, r4h: { hit: false, pct: 1 } },
+    { ts: base - 5 * H, symbol: 'ETHUSDT', dir: 'long', score: 70, price: 1, gated: true, gates: {} }
+  ];
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)};`);
+  await page.evaluate((ts) => openLedgerSignal('BTCUSDT', ts), recs[0].ts);
+  await page.waitForFunction(() => window.__sigMarkApi && window.__sigMarkApi.markers().length >= 2, null, { timeout: 15000 });
+  const m = await page.evaluate(() => window.__sigMarkApi.markers().map((x) => x.text));
+  assert.ok(m.includes('多68✓'), JSON.stringify(m));
+  assert.ok(m.includes('拦空35✗'), JSON.stringify(m));
+  assert.ok(!m.some((t) => /70/.test(t)), '其他币的信号不应出现');
+  const lines = await page.evaluate(() => (window.__focusLines || []).map((l) => l.options().title));
+  assert.deepEqual(lines, ['信号入场', '信号止损', '信号目标']);
+  await page.click('#sigMarkToggle');
+  assert.equal(await page.evaluate(() => window.__sigMarkApi.markers().length), 0);
+  assert.equal(await page.evaluate(() => (window.__focusLines || []).length), 0);
+  assert.deepEqual(errors, []);
+});
+
+test('门控开关 + 评分版本：设置里关闭过热区立即生效；台账默认只统计当前版本，可切换到全部；随机基线表显示', { skip }, async () => {
+  const now = Date.now() - 6 * 3600e3;
+  const mk = (i, ver, hit) => ({ ts: now - i * 60e3, symbol: 'AUSDT', dir: i % 2 ? 'long' : 'short', score: i % 2 ? 66 : 30, price: 1, gated: true, gates: {}, resolved: true, ver,
+    r1h: { price: 1, pct: 0.1, hit }, r4h: { price: 1, pct: hit === (i % 2 === 1) ? 1 : -1, hit, btcPct: 0.2 } });
+  const recs = [].concat(Array.from({ length: 40 }, (_, i) => mk(i, '2', i % 3 !== 0)), Array.from({ length: 10 }, (_, i) => mk(100 + i, undefined, false)));
+  // 同一浏览器上下文里的测试共享 localStorage：显式重置本测试依赖的设置
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.setItem('novatrade_ledger_scope', 'current'); localStorage.removeItem('novatrade_gates_v1');`);
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => /信号 vs 随机基线/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 15000 });
+  // 启动时推荐扫描本身也会新增若干条当前版本的记录，所以期望值按页面里的实际记录数计算
+  await page.waitForFunction(() => {
+    const n = fwdRecords.filter((r) => r.ver === SCORING_VERSION).length;
+    return document.getElementById('fwdLedger').innerText.includes('共 ' + n + ' 条信号') && !document.getElementById('recommendRefreshNote');
+  }, null, { timeout: 30000 });
+  const cnt = await page.evaluate(() => ({ cur: fwdRecords.filter((r) => r.ver === SCORING_VERSION).length, all: fwdRecords.length }));
+  assert.ok(cnt.cur >= 40 && cnt.all === cnt.cur + 10);
+  let t = await page.locator('#fwdLedger').innerText();
+  assert.ok(t.includes('共 ' + cnt.cur + ' 条信号'), '默认只统计当前版本');
+  assert.match(t, /全部版本（含旧版 10 条）/);
+  assert.match(t, /相对 BTC 方向超额/);
+  await page.click('button:has-text("全部版本")');
+  t = await page.locator('#fwdLedger').innerText();
+  assert.ok(t.includes('共 ' + cnt.all + ' 条信号'));
+  // 设置：关闭过热区
+  await page.click(`[onclick="showView('settings')"], [data-onclick="showView('settings')"]`);
+  await page.waitForSelector('[data-gate="overheat"]');
+  await page.uncheck('[data-gate="overheat"]');
+  await page.waitForFunction(() => /已关闭 1 道门控/.test(document.getElementById('gateMsg').textContent));
+  assert.equal(await page.evaluate(() => gateCfg().overheat), false);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('novatrade_gates_v1')).overheat), false);
+  await page.uncheck('[data-gate="score39"]');
+  assert.equal(await page.evaluate(() => SHORT_SCORE_MIN), 45);
+  await page.click('button:has-text("全部恢复默认")');
+  assert.equal(await page.evaluate(() => SHORT_SCORE_MIN), 39);
+  assert.deepEqual(errors, []);
+});
+
+test('模拟跟踪：按现价入场、「暂不交易」信号需确认、实时推送触及目标立即归档并显示净收益', { skip }, async () => {
+  const { page, errors } = await open("localStorage.removeItem('novatrade.linked-state.v1');");
+  await page.evaluate(`${RT}[0].onopen()`);
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => document.querySelectorAll('.recommend-card').length > 0 && !document.getElementById('recommendRefreshNote'), null, { timeout: 30000 });
+  const btn = page.locator('.recommend-card button:has-text("模拟跟踪")').first();
+  const card = page.locator('.recommend-card').first();
+  const sym = await card.getAttribute('data-coin');
+  const blocked = await card.evaluate((el) => el.classList.contains('low-trust'));
+  // 假行情里 24h 行情价与 K 线价不一致；真实环境两者一致。这里让现价等于卡片上的价格，否则会被（正确地）判为已越过止损
+  await page.evaluate((s) => { const g = window.__recGroups; const c = g.buy.concat(g.sell).find((x) => x.symbol === s); allCoins.find((x) => x.symbol === s).price = c.price; }, sym);
+  let asked = 0;
+  page.on('dialog', async (d) => { asked++; await d.accept(); });
+  await btn.click();
+  await page.waitForFunction((s) => (JSON.parse(localStorage.getItem('novatrade.linked-state.v1') || '{"tracks":[]}').tracks || []).some((t) => t.symbol === s), sym);
+  assert.equal(asked, blocked ? 1 : 0, '「暂不交易」信号应先弹确认');
+  const t = await page.evaluate((s) => JSON.parse(localStorage.getItem('novatrade.linked-state.v1')).tracks.find((x) => x.symbol === s), sym);
+  const live = await page.evaluate((s) => allCoins.find((c) => c.symbol === s).price, sym);
+  assert.equal(t.entry, live, '入场价 = 现价');
+  assert.equal(t.blocked, blocked);
+  // 推送一个越过目标的价格：1 秒内归档
+  const px = t.direction === 'long' ? t.target * 1.01 : t.target * 0.99;
+  await page.evaluate(`${RT}[0].onmessage({ data: JSON.stringify([{ s: '${sym}', c: '${px}', o: '${t.entry}', q: '1' }]) })`);
+  await page.waitForFunction((s) => JSON.parse(localStorage.getItem('novatrade.linked-state.v1')).tracks.find((x) => x.symbol === s).status === 'target', sym, { timeout: 5000 });
+  const done = await page.evaluate((s) => JSON.parse(localStorage.getItem('novatrade.linked-state.v1')).tracks.find((x) => x.symbol === s), sym);
+  assert.ok(Math.abs(done.net - (done.pnl - 0.12)) < 1e-9);
+  assert.ok(done.mfe >= done.pnl - 1e-9);
+  await page.waitForFunction(() => /已结束 1 笔/.test(document.getElementById('linkedDetail').innerText), null, { timeout: 8000 });
+  assert.deepEqual(errors, []);
+});
+
+test('行情状态：台账显示分组命中率；开启暂停后，处于显著偏弱状态的推荐显示为「暂不交易」并说明原因', { skip }, async () => {
+  const now = Date.now() - 6 * 3600e3;
+  // 所有状态组合都给 40 条命中率 10% 的放行记录 → 任何当前状态都会被判为显著偏弱
+  const recs = [];
+  for (const state of ['trend', 'range', 'weak']) for (let i = 0; i < 40; i++) recs.push({ ts: now - recs.length * 1000, symbol: 'ZUSDT', dir: 'long', score: 66, price: 1, gated: true, gates: {}, resolved: true, ver: '2', regime: { state, btc: 'flat', vol: 'mid' }, r1h: { hit: false, pct: -1 }, r4h: { hit: i < 4, pct: i < 4 ? 1 : -1 } });
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.setItem('novatrade_ledger_scope', 'current'); localStorage.setItem('novatrade_regime_guard', '1'); localStorage.removeItem('novatrade.recommend-snapshot.v1');`);
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => /按行情状态分组/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 30000 });
+  assert.match(await page.locator('#fwdLedger .fa-wrap:has-text("按行情状态分组")').innerText(), /显著偏弱/);
+  await page.waitForFunction(() => /当前行情状态历史表现显著偏弱/.test(document.getElementById('recommendGrid').innerText), null, { timeout: 30000 });
+  await page.evaluate(() => localStorage.setItem('novatrade_regime_guard', '0'));
+  assert.deepEqual(errors, []);
+});
+
+test('市场雷达：推送数据进入异动榜并触发异动提醒；资金面排行显示费率 / 持仓量 / 多空比榜单', { skip }, async () => {
+  const { page, errors } = await open("localStorage.setItem('novatrade_radar_cfg', JSON.stringify({ on: true, pct: 2, cool: 30 }));");
+  await page.evaluate(`${RT}[0].onopen()`);
+  // 伪造过去 6 分钟的采样：ETH 从 100 涨到 104
+  await page.evaluate(() => {
+    const now = Date.now();
+    window.__radar.s = { ETHUSDT: [], SOLUSDT: [] };
+    for (let t = now - 6 * 60e3; t <= now; t += 10000) {
+      const k = (t - (now - 6 * 60e3)) / (6 * 60e3);
+      window.__radar.s.ETHUSDT.push([t, 100 + 4 * k, 288000 + k * 3000]);
+      window.__radar.s.SOLUSDT.push([t, 50, 1000]);
+    }
+  });
+  await page.click(`[onclick="showView('radar')"], [data-onclick="showView('radar')"]`);
+  await page.waitForFunction(() => /ETH/.test((document.getElementById('radarMovers') || {}).innerText || ''), null, { timeout: 8000 });
+  const first = await page.locator('#radarMovers tbody tr').first().innerText();
+  assert.match(first, /^ETH/);
+  assert.match(first, /\+3\.\d\d%/);
+  await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'electronAPI.pushSend' && /ETH 5 分钟急涨/.test(JSON.stringify(c))), null, { timeout: 8000 });
+  await page.waitForFunction(() => /资金费率最高/.test(document.getElementById('radarDeriv').innerText) && /账户多空比最高/.test(document.getElementById('radarDeriv').innerText), null, { timeout: 15000 });
+  const d = await page.locator('#radarDeriv').innerText();
+  assert.match(d, /持仓量 24h 增长最多/);
+  assert.equal(await page.evaluate(() => window.__calls.filter((c) => c[0] === 'premiumAll').length), 1);
+  await page.click('#radarMovers tbody tr >> nth=0');
+  assert.equal(await page.evaluate(() => document.querySelector('.view.active').id), 'view-analysis');
+  await page.evaluate(() => localStorage.removeItem('novatrade_radar_cfg'));
+  assert.deepEqual(errors, []);
+});
+
+test('真实成交：只读 Key 保存（有交易权限的被拒）、API 导入、CSV 导入、按信号对照、写入交易日志', { skip }, async () => {
+  const t0 = Date.now() - 3 * 3600e3;
+  // 一条 SOL 同方向信号（开仓前 1 小时）→ API 导入的那笔 SOL 现货交易应标为「按信号做」
+  const recs = [{ ts: t0 - 3600e3, symbol: 'SOLUSDT', dir: 'long', score: 71, price: 99, gated: true, gates: {}, ver: '2' }];
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.removeItem('novatrade_fills_v1'); localStorage.removeItem('novatrade_journal_v1');`);
+  page.on('dialog', (d) => d.accept());
+  // 设置：有交易权限的 Key 被拒绝；只读 Key 保存后只显示尾号
+  await page.click(`[onclick="showView('settings')"], [data-onclick="showView('settings')"]`);
+  await page.fill('#acct_key', 'TRADEKEY'.repeat(5));
+  await page.fill('#acct_secret', 'S'.repeat(40));
+  await page.click('button:has-text("验证并保存")');
+  await page.waitForFunction(() => /只接受只读 Key/.test(document.getElementById('acctMsg').textContent));
+  await page.fill('#acct_key', 'A'.repeat(36) + 'WXYZ');
+  await page.fill('#acct_secret', 'S'.repeat(40));
+  await page.click('button:has-text("验证并保存")');
+  await page.waitForFunction(() => /已配置：••••WXYZ/.test(document.getElementById('settingsWrap').innerText));
+  // API 导入
+  await page.click(`[onclick="showView('mine')"], [data-onclick="showView('mine')"]`);
+  await page.click(`[onclick="switchMinePane('m_fills')"], [data-onclick="switchMinePane('m_fills')"]`);
+  await page.click('button:has-text("从只读 API 导入")');
+  await page.waitForFunction(() => /新增 2 笔成交/.test(document.getElementById('fillsMsg').textContent));
+  assert.match(await page.locator('#fillsMsg').innerText(), /导入 CSV/, '合约读不了时提示改用 CSV');
+  let t = await page.locator('#fillsWrap').innerText();
+  assert.match(t, /还原出 1 笔完整交易/);
+  assert.match(t, /按信号做 \(71分\)/);
+  // CSV 导入（合约做空一笔）
+  const csv = 'Date(UTC),Symbol,Side,Price,Quantity,Amount,Fee,Realized Profit\n' +
+    new Date(t0).toISOString().slice(0, 19).replace('T', ' ') + ',ETHUSDT,SELL,2000,1,2000,0.8USDT,0\n' +
+    new Date(t0 + 7200e3).toISOString().slice(0, 19).replace('T', ' ') + ',ETHUSDT,BUY,1900,1,1900,0.76USDT,100\n';
+  await page.setInputFiles('#fillsWrap input[type=file]', { name: 'trades.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await page.waitForFunction(() => /还原出 2 笔完整交易/.test(document.getElementById('fillsWrap').innerText));
+  t = await page.locator('#fillsWrap').innerText();
+  assert.match(t, /ETH 合约/);
+  assert.match(t, /\+98\.44/, '合约空单盈亏 = 100 − 手续费 1.56');
+  // 重复导入不会重复计数
+  await page.setInputFiles('#fillsWrap input[type=file]', { name: 'trades.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await page.waitForFunction(() => /新增 0 笔成交/.test(document.getElementById('fillsMsg').textContent));
+  // 写入交易日志（再写一次不会重复）
+  await page.click('button:has-text("写入交易日志")');
+  await page.waitForFunction(() => /已写入 2 笔/.test(document.getElementById('fillsMsg').textContent));
+  await page.click('button:has-text("写入交易日志")');
+  await page.waitForFunction(() => /没有新的完整交易/.test(document.getElementById('fillsMsg').textContent));
+  const jr = await page.evaluate(() => loadJournal().map((j) => j.symbol + ':' + j.src).sort());
+  assert.deepEqual(jr, ['ETHUSDT:manual', 'SOLUSDT:signal']);
+  assert.deepEqual(errors, []);
 });

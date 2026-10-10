@@ -32,7 +32,7 @@ function defaultRequest(o) {
     const done = (fn, v) => { if (!settled) { settled = true; fn(v); } };
     const req = https.get({
       hostname: o.host, port: 443, path: o.path, method: 'GET', agent: o.agent,
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+      headers: Object.assign({ 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }, o.headers || {})
     }, (res) => {
       const chunks = [];
       let size = 0;
@@ -110,7 +110,7 @@ function createBinanceHttp(options) {
     let lastErr = null;
     for (const host of opt.hosts) {
       try {
-        const r = await request({ host, path: opt.path, agent: opt.agent, timeoutMs });
+        const r = await request({ host, path: opt.path, agent: opt.agent, timeoutMs, headers: opt.headers });
         const st = r.status;
         if (st >= 200 && st < 300) {
           try { return JSON.parse(r.body); }
@@ -135,7 +135,7 @@ function createBinanceHttp(options) {
     throw lastErr || new HttpError('no hosts configured', { kind: 'network' });
   }
 
-  // opt: { family, hosts[], path, agent, proxyKey, timeoutMs }
+  // opt: { family, hosts[], path, agent, proxyKey, timeoutMs, headers, noDedupe }
   //   family   —— 限流 / 并发的分组（'spot' | 'futures' | 'generic:host'）
   //   proxyKey —— 当前代理标识，仅用于去重键（代理变了就不应复用旧请求）
   function requestJson(opt) {
@@ -146,7 +146,7 @@ function createBinanceHttp(options) {
         { kind: 'ratelimit', status: 429, retryAfterMs: until - t }));
     }
     const key = opt.family + '|' + (opt.proxyKey || 'direct') + '|' + opt.path;
-    const existing = inflight.get(key);
+    const existing = opt.noDedupe ? null : inflight.get(key);
     if (existing) return existing;
     const s = sem(opt.family);
     const p = (async () => {

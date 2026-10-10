@@ -6,18 +6,22 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test",
-    "build": "electron-builder"
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
   },
   "author": "NovaTrade",
   "license": "ISC",
   "devDependencies": {
-    "electron": "^33.0.0",
-    "electron-builder": "^25.0.0"
+    "electron": "^44.6.0",
+    "electron-builder": "^26.15.3"
   },
   "keywords": [],
   "type": "commonjs",
   "dependencies": {
-    "lightweight-charts": "^5.2.1"
+    "lightweight-charts": "^5.2.1",
+    "electron-updater": "^6.8.10"
   },
   "build": {
     "appId": "com.novatrade.app",
@@ -30,6 +34,8 @@
       "renderer/index.html",
       "renderer/app.js",
       "renderer/settings.js",
+      "renderer/radar.js",
+      "renderer/fills-view.js",
       "renderer/lib/*.js",
       "renderer/widget.html",
       "renderer/widget.js",
@@ -62,6 +68,48 @@
       "include": "installer.nsh"
     },
     "artifactName": "${productName}-Setup-${version}.${ext}",
-    "asar": false
+    "asar": false,
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "121012445",
+        "repo": "NovaTrade",
+        "releaseType": "draft"
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.finance",
+      "icon": "assets/icon.png",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Finance",
+      "icon": "assets/icon.png",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    }
   }
 }

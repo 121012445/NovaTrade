@@ -10,6 +10,15 @@
 - **行情**：币安合约 `!miniTicker@arr` WebSocket 推送（每秒更新），断线自动指数退避重连；推送不可用时回退到轮询。币安整体不可达时回退到 OKX 现货公开行情（界面会标明「备用数据源」）。
 - **AI 推荐 / 技术分析**：15m/1h/4h 加权评分（只用**已收盘** K 线）、支撑阻力、风险回报、日线趋势门控；附带相对 BTC 强弱、衍生品倾向（资金费率 / 持仓量 / 多空比，未经验证、仅记录）。
 - **信号前向验证**：记录每条推荐，1h/4h 后用真实价格结算方向命中率；影子模型（逻辑回归）仅在样本外检验有效时才显示概率，不参与评分与门控。
+- **信号是否有效**（信号台账上方）：
+  - 随机基线：同一批币、同一时间随机给方向（置换检验），看命中率是否显著高于随机；附「全做多 / 全做空」与相对 BTC 超额收益。
+  - 门控归因：每道门控拦下的信号与放行的信号比较，区间不重叠才下结论；门控可在设置里单独开关（关闭后仍记录「本来会不会拦」）。
+  - 按行情状态（该币 ADX 状态 / BTC 环境 / 波动）分组的命中率，可选在显著偏弱的状态下暂停信号。
+  - 记录带评分版本，默认只统计当前版本，避免新旧口径混在一起。
+  - K 线图上标出历史信号与模拟跟踪；从台账点一条信号会画出它的入场 / 止损 / 目标线。
+- **模拟跟踪**：按点击时的现价入场（越过止损 / 目标的拒绝），记录最大浮盈 / 浮亏、扣成本的净收益、相对 BTC 超额；「暂不交易」的信号需确认并单独统计。
+- **市场雷达**：基于实时推送的 5 / 15 分钟异动榜与可选提醒；全市场资金费率、持仓量 24h 变化、账户多空比排行。
+- **真实成交**：用**仅读取权限**的币安 API Key（带交易 / 提现等任何权限的 Key 会被拒绝）或币安导出的 CSV 导入成交，还原成完整交易，与系统信号对照，可写入交易日志。
 - **回测**：
   - 阈值扫描（近似）与完整回测（逐根 K 线、实际止损止盈、日线门控）；
   - 成本模型含手续费、滑点、资金费率，开盘跳空越过止损按开盘价成交，同币种不重叠持仓；
@@ -22,14 +31,23 @@
 
 ## 开发
 
-要求：Node.js 20+（开发 / 测试）。运行桌面应用需要先 `npm install`（会安装 Electron）。
+要求：Node.js 20+（开发 / 测试）。运行桌面应用需要先 `npm install`。
 
 ```bash
-npm install
-npm start          # 启动应用
-npm test           # 运行测试（不依赖 npm 包）
-npm run build      # 打包 Windows 安装包（electron-builder）
+npm install          # 首次会生成 package-lock.json（旧的 lock 对应 Electron 33，已删除），请一并提交
+npm start            # 启动应用（Electron 44 首次运行时才下载自身二进制）
+npm test             # 运行测试（不依赖 npm 包）
+npm run build:win    # 打包 Windows 安装包；build:mac / build:linux 同理（需在对应系统上打包）
 ```
+
+### 发版与自动更新
+
+1. 修改 `package.json` 的 `version` 并提交；
+2. `git tag v1.3.0 && git push origin v1.3.0`；
+3. GitHub Actions（`.github/workflows/release.yml`）会在 Windows / macOS / Linux 上打包、上传到同一个 Release 并发布。
+
+已安装的应用启动 30 秒后、之后每 6 小时检查一次，发现新版本在后台下载，提示「重启并安装」（不点也会在退出时安装），可在设置里关闭自动下载。
+没有代码签名证书：Windows 安装包会出现 SmartScreen 提示；**macOS 未签名版本无法自动更新**，只会提示有新版本，需要手动下载。
 
 ### 目录结构
 
@@ -41,11 +59,14 @@ main/                 主进程
   push.js llm.js      远程推送 / AI 解读（凭据用 safeStorage 加密）
   kline-store.js      本地历史 K 线库
   okx.js              备用数据源
+  binance-account.js  只读 API：权限校验、签名请求、导入成交
+  updater.js          自动更新（electron-updater）
   diagnostics.js      诊断包脱敏、更新检查
   gpu-config.js       硬件加速 / 软件渲染开关
 renderer/
-  index.html app.js settings.js widget.html widget.js
-  lib/                纯逻辑（浏览器与 Node 共用）：指标、评分、回测、预警、实时行情、影子模型、组合风险、内联处理器
+  index.html app.js settings.js radar.js fills-view.js widget.html widget.js
+  lib/                纯逻辑（浏览器与 Node 共用）：指标、评分、回测、预警、实时行情、影子模型、组合风险、信号归因、
+                      信号标注、模拟跟踪、市场雷达、成交还原、内联处理器；bt-worker.js 是回测后台线程
 bt/                   回测 CLI 与 Node 引擎加载器（见 bt/README.md）
 test/ testlib/        测试与测试设施
 ```
@@ -77,5 +98,7 @@ npm test
 
 - 回测币种池取「当前」成交额靠前的币，存在幸存者偏差；回测与评分都不含 BTC 趋势一票否决（需要实时 BTC 分析）。
 - OKX 备用数据源仅覆盖现货 USDT 对，K 线最多 300 根，无合约 / 衍生品数据。
-- 更新检查只提示新版本并打开发布页，不自动下载安装（自动更新需要 `electron-updater` 依赖与签名发布流程）。
-- 回测长循环在 UI 线程里按时间片让出（未使用 Web Worker：`file://` 页面下的 Worker 行为在 Electron 与浏览器间不一致，未验证）。
+- 仓库目前还没有发布过 Release：第一次打 tag 发版之后，自动更新才有东西可以下载。
+- 回测的信号收集放在 Web Worker 里；Worker 创建失败时自动退回主线程（结果一致，只是界面会稍卡）。Electron 里 `file://` 页面创建 Worker 的行为未在真机验证，测试里用 Chromium 的 `--allow-file-access-from-files` 模拟。
+- 币安部分合约读取接口可能要求 Key 开启「允许合约」（同时允许合约交易），本应用不接受这类 Key，此时合约成交请用 CSV 导入。
+- 升级到 Electron 44 / electron-builder 26 后未在真机上运行过，请先 `npm install && npm start` 试一遍。

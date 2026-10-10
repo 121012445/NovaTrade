@@ -9,9 +9,9 @@ const html = fs.readFileSync(path.join(RENDERER, 'index.html'), 'utf8');
 
 test('index.html 按 bt/engine.js 的 LIB_ORDER 顺序加载 lib 脚本，最后才是 app.js', () => {
   const srcs = [...html.matchAll(/<script\s+src="?([^"\s>]+)"?\s*>\s*<\/script>/g)].map((m) => m[1]);
-  const mine = srcs.filter((s) => s.startsWith('lib/') || s === 'app.js' || s === 'settings.js');
+  const mine = srcs.filter((s) => s.startsWith('lib/') || s === 'app.js' || s === 'settings.js' || s === 'radar.js' || s === 'fills-view.js');
   // inline-handlers 只依赖 DOM，不进 Node 引擎；它必须在 app.js 之前加载
-  assert.deepEqual(mine, LIB_ORDER.concat(['lib/inline-handlers.js', 'app.js', 'settings.js']));
+  assert.deepEqual(mine, LIB_ORDER.concat(['lib/inline-handlers.js', 'app.js', 'settings.js', 'radar.js', 'fills-view.js']));
   assert.ok(srcs.indexOf('lightweight-charts.js') < srcs.indexOf(LIB_ORDER[0]), '图表库应先于业务脚本');
 });
 
@@ -20,6 +20,8 @@ test('lib 与 app.js 都在打包文件列表里（electron-builder files 是白
   const files = pkg.build.files;
   assert.ok(files.includes('renderer/app.js'));
   assert.ok(files.includes('renderer/settings.js'));
+  assert.ok(files.includes('renderer/radar.js'));
+  assert.ok(files.includes('renderer/fills-view.js'));
   assert.ok(files.includes('renderer/widget.js'));
   assert.ok(files.includes('renderer/lib/*.js'));
   assert.ok(files.includes('main/*.js'));

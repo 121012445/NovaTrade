@@ -62,6 +62,37 @@
       '<div class="set-note">扫描范围越大，每轮请求越多（每个币 4 个周期各一次，3 分钟一轮）。新信号提醒默认关闭；同一币同一方向 4 小时内只提醒一次，带「仅观察」标记表示前向验证尚未达标。</div></div>';
   }
 
+  var GATE_INFO = [
+    ["overheat", "过热区：70–74 分不做多", "依据作者早期约 7–14 条样本的 4h 命中率定下"],
+    ["daily", "日线趋势门控", "做多需日线 EMA20>EMA50 或收盘在 EMA20 上方；做空反之"],
+    ["stopCap", "止损距离上限", "止损距离超过价格的 " + (window.MAX_STOP_PCT || 15) + "% 不给信号"],
+    ["score39", "空头评分门槛", "开启：评分 <39 才做空；关闭：放宽到 <45"],
+    ["btcVeto", "BTC 偏多时否决做空", "BTC 处于明确上升趋势时不做空山寨"],
+    ["nearSup", "距支撑 <1ATR 不做空", "避免在支撑位附近追空"]
+  ];
+  function gateCardHtml() {
+    var g = window.gateCfg ? window.gateCfg() : {};
+    return '<div class="set-card"><h3>门控开关</h3>' +
+      '<div class="set-note">门控会拦下一部分信号（台账里显示「已拦截」）。关闭某道门控后，它不再拦截信号，但台账仍会记录「这道门控本来会不会拦」，' +
+      '所以「门控归因」表可以继续比较两组的表现。建议只在归因表显示「拦下的反而更好」且样本足够时再关闭。改动从下一轮推荐开始生效。</div>' +
+      GATE_INFO.map(function (x) {
+        return '<div class="set-row"><label class="nf-check"><input type="checkbox" data-gate="' + x[0] + '"' + (g[x[0]] !== false ? " checked" : "") +
+          ' onchange="settingsSaveGates()"><span><b>' + esc(x[1]) + '</b> <span class="set-note">' + esc(x[2]) + '</span></span></label></div>';
+      }).join("") +
+      '<div class="set-row"><label class="nf-check"><input type="checkbox" onchange="settingsToggleRegime(this.checked)"' + (window.regimeGuardOn && window.regimeGuardOn() ? " checked" : "") + '><span><b>在显著偏弱的行情状态下暂停信号</b> <span class="set-note">某个行情状态（如「震荡市」「BTC 下降」）累计 ≥30 条放行信号且 4h 命中率区间上限 &lt;50% 时，该状态下的推荐显示为「暂不交易」。默认关闭。</span></span></label></div>' +
+      '<div class="set-row"><button class="btn-ghost" onclick="settingsResetGates()">全部恢复默认（开启）</button></div>' +
+      '<div id="gateMsg" class="set-result"></div></div>';
+  }
+  window.settingsSaveGates = function () {
+    var cfg = {};
+    document.querySelectorAll("[data-gate]").forEach(function (el) { cfg[el.getAttribute("data-gate")] = el.checked; });
+    var out = window.saveGateCfg(cfg);
+    var off = Object.keys(out).filter(function (k) { return !out[k]; });
+    msg("gateMsg", off.length ? "已关闭 " + off.length + " 道门控，下一轮推荐生效" : "全部门控已开启", true);
+  };
+  window.settingsToggleRegime = function (on) { window.setRegimeGuard(!!on); toast(on ? "已开启：显著偏弱的行情状态下暂停信号" : "已关闭行情状态暂停"); };
+  window.settingsResetGates = function () { window.saveGateCfg({}); renderSettings(); toast("门控已全部恢复为开启"); };
+
   function llmCardHtml() {
     var c = S.llm || {};
     return '<div class="set-card"><h3>AI 解读</h3>' +
@@ -77,9 +108,37 @@
       '<div id="llmMsg" class="set-result"></div></div>';
   }
 
+  function accountCardHtml() {
+    var c = S.account || {};
+    return '<div class="set-card"><h3>交易所只读 API（导入真实成交）</h3>' +
+      '<div class="set-note">用于「持仓与复盘 → 真实成交」从币安导入你的成交记录。<b>只接受仅读取权限的 Key</b>：保存前会向币安查询该 Key 的权限，' +
+      '只要开了交易、杠杆、合约、期权、提现或划转中的任何一项就拒绝保存。Key 与 Secret 用系统安全存储加密，界面只显示尾号。' +
+      '建议在币安为这个 Key 绑定 IP 白名单。不想配置 Key 的话，也可以直接在「真实成交」里导入币安导出的 CSV。</div>' +
+      (c.configured ? '<div class="set-note">已配置：' + esc(c.apiKey) + (c.perms ? (c.perms.ipRestrict ? " · 已绑定 IP 白名单" : " · 未绑定 IP 白名单") : "") + '</div>' : "") +
+      '<div class="set-row"><label>API Key<input type="text" id="acct_key" autocomplete="off" placeholder="' + (c.configured ? "重新填写可替换" : "") + '"></label>' +
+      '<label>Secret Key<input type="password" id="acct_secret" autocomplete="off"></label>' +
+      '<button class="btn-primary" onclick="accountSave()"' + (c.canStore === false ? " disabled" : "") + '>验证并保存</button>' +
+      (c.configured ? '<button class="btn-ghost" onclick="accountClear()">删除</button>' : "") + '</div>' +
+      '<div id="acctMsg" class="set-result"></div></div>';
+  }
+  window.accountSave = async function () {
+    var a = api();
+    if (!a.accountSetKey) return;
+    setBusy("acctMsg", "正在向币安查询该 Key 的权限……");
+    var r = await a.accountSetKey(($("acct_key") || {}).value, ($("acct_secret") || {}).value);
+    if (r && r.ok) { S.account = r.config; renderSettings(); toast("只读 API Key 已保存"); }
+    else msg("acctMsg", (r && (r.error || r.__error)) || "保存失败", false);
+  };
+  window.accountClear = async function () {
+    var a = api();
+    if (!a.accountSetKey || !window.confirm("删除已保存的只读 API Key？")) return;
+    var r = await a.accountSetKey("", "");
+    if (r && r.ok) { S.account = r.config; renderSettings(); }
+  };
+
   function dataCardHtml() {
     return '<div class="set-card"><h3>数据与备份</h3>' +
-      '<div class="set-note">备份包含：自选、价格预警、持仓、交易日志、各类设置，以及信号前向验证记录。<b>不包含</b>推送令牌与 API Key（它们由系统安全存储保护，不会写进备份文件）。导入会覆盖同名的本地数据，并重新加载页面。</div>' +
+      '<div class="set-note">备份包含：自选、价格预警、持仓、交易日志、已导入的真实成交、各类设置，以及信号前向验证记录。<b>不包含</b>推送令牌、AI 接口密钥与交易所 API Key（它们由系统安全存储保护，不会写进备份文件）。导入会覆盖同名的本地数据，并重新加载页面。</div>' +
       '<div class="set-row"><button class="btn-ghost" onclick="backupExport()">导出备份</button><button class="btn-ghost" onclick="backupImport()">导入备份</button></div>' +
       '<div id="backupMsg" class="set-result"></div></div>';
   }
@@ -90,6 +149,7 @@
       '<div class="set-row"><button class="btn-ghost" onclick="checkUpdateNow()">检查更新</button>' +
       '<button class="btn-ghost" onclick="exportDiag()">导出诊断包</button>' +
       '<button class="btn-ghost" onclick="openReleasePage()">打开发布页</button></div>' +
+      '<div id="updateBox"></div>' +
       '<div id="aboutMsg" class="set-result"></div>' +
       '<div class="set-note">诊断包包含版本、代理状态与最近的错误日志，令牌 / 密钥 / 带参数的 URL 已脱敏，可以直接发给开发者排查问题。</div></div>';
   }
@@ -106,9 +166,13 @@
     try {
       if (a.pushGetConfig) { var pc = await a.pushGetConfig(); if (pc && pc.channels) { S.channels = pc.channels; S.canStore = pc.canStore !== false; } }
       if (a.llmGetConfig) S.llm = await a.llmGetConfig();
+      if (a.accountGetConfig) S.account = await a.accountGetConfig();
     } catch (e) { console.warn("[settings] load failed:", e && e.message); }
-    root.innerHTML = pushCardHtml() + generalCardHtml() + llmCardHtml() + dataCardHtml() + aboutCardHtml() + disclaimerHtml();
+    var upd = null;
+    try { if (a.updateStatus) upd = await a.updateStatus(); } catch (e) {}
+    root.innerHTML = pushCardHtml() + generalCardHtml() + gateCardHtml() + llmCardHtml() + accountCardHtml() + dataCardHtml() + aboutCardHtml() + disclaimerHtml();
     try {
+      paintUpdate(upd);
       var info = a.appInfo ? await a.appInfo() : null;
       var ds = window.__dataSource;
       var el = $("aboutInfo");
@@ -257,6 +321,34 @@
     if (r && r.ok) msg("aboutMsg", "已导出：" + r.path, true);
     else if (!(r && r.canceled)) msg("aboutMsg", (r && (r.error || r.__error)) || "导出失败", false);
   };
+  // ---------- 自动更新状态（main/updater.js 推送）----------
+  var UPDATE_TEXT = { idle: "", checking: "正在检查更新…", latest: "已是最新版本", available: "发现新版本", downloading: "正在下载更新", downloaded: "新版本已下载", error: "自动更新出错" };
+  function updateBoxHtml(st) {
+    if (!st) return "";
+    if (!st.available) return '<div class="set-note">自动更新组件未安装（需要执行 npm install），只能手动检查。</div>';
+    if (!st.packaged) return '<div class="set-note">开发模式下不自动更新；打包安装后会自动检查。</div>';
+    var line = UPDATE_TEXT[st.status] || "";
+    if (st.status === "available" || st.status === "downloaded") line += " " + esc(st.version || "");
+    if (st.status === "downloading") line += " " + (st.percent || 0) + "%";
+    if (st.status === "error") line += "：" + esc(st.error || "");
+    return '<div class="set-row">' +
+      '<label class="nf-check"><input type="checkbox" onchange="settingsSetAutoUpdate(this.checked)"' + (st.autoDownload ? " checked" : "") + '><span>发现新版本时自动在后台下载' + (st.canInstall ? "" : "（macOS 未签名版本只能手动下载）") + '</span></label>' +
+      (st.status === "available" && st.canInstall && !st.autoDownload ? '<button class="btn-ghost" onclick="settingsDownloadUpdate()">下载更新</button>' : "") +
+      (st.status === "downloaded" ? '<button class="btn-primary" onclick="settingsInstallUpdate()">重启并安装</button>' : "") +
+      '</div>' + (line ? '<div class="set-note">' + line + (st.status === "downloaded" ? "（不点也会在下次退出应用时自动安装）" : "") + '</div>' : "");
+  }
+  function paintUpdate(st) { var el = $("updateBox"); if (el) el.innerHTML = updateBoxHtml(st); }
+  window.settingsSetAutoUpdate = function (on) { var a = api(); if (a.updateSetAuto) a.updateSetAuto(!!on); };
+  window.settingsDownloadUpdate = function () { var a = api(); if (a.updateDownload) a.updateDownload(); };
+  window.settingsInstallUpdate = function () { var a = api(); if (a.updateInstall) a.updateInstall(); };
+  (function listenUpdates() {
+    var a = api(), told = false;
+    if (!a.onUpdateStatus) return;
+    a.onUpdateStatus(function (st) {
+      paintUpdate(st);
+      if (st && st.status === "downloaded" && !told) { told = true; toast("新版本 " + (st.version || "") + " 已下载，可在「设置 → 诊断与更新」重启安装"); }
+    });
+  })();
   window.openReleasePage = function () { var a = api(); if (a.openReleases) a.openReleases(); };
 
   // 启动后静默检查一次更新（每天最多一次；只提示，不自动下载 / 安装）

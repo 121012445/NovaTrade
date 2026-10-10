@@ -18,7 +18,9 @@ try {
     getFuturesDepth: (symbol, limit) => ipcRenderer.invoke('binance:futuresDepth', symbol, limit),
     getAggTrades: (symbol, limit) => ipcRenderer.invoke('binance:aggTrades', symbol, limit),
     getHistory: (symbol, interval, bars) => ipcRenderer.invoke('history:get', symbol, interval, bars),
-    getDataSource: () => ipcRenderer.invoke('data:source')
+    getDataSource: () => ipcRenderer.invoke('data:source'),
+    premiumAll: () => ipcRenderer.invoke('binance:premiumAll'),
+    derivLite: (symbol) => ipcRenderer.invoke('deriv:lite', symbol)
   });
   contextBridge.exposeInMainWorld('electronAPI', {
     minimize: () => ipcRenderer.send('window:minimize'),
@@ -47,6 +49,9 @@ try {
     exportCsv: (defaultName, text) => ipcRenderer.invoke('file:exportCsv', defaultName, text),
     exportPng: (defaultName, dataUrl) => ipcRenderer.invoke('file:exportPng', defaultName, dataUrl),
     setTrayStatus: (text) => ipcRenderer.invoke('tray:status', text),
+    accountGetConfig: () => ipcRenderer.invoke('account:getConfig'),
+    accountSetKey: (key, secret) => ipcRenderer.invoke('account:setKey', key, secret),
+    accountImport: (opts) => ipcRenderer.invoke('account:import', opts),
     pushGetConfig: () => ipcRenderer.invoke('push:getConfig'),
     pushSetConfig: (cfg) => ipcRenderer.invoke('push:setConfig', cfg),
     pushSend: (msg) => ipcRenderer.invoke('push:send', msg),
@@ -57,6 +62,11 @@ try {
     appInfo: () => ipcRenderer.invoke('app:info'),
     checkUpdate: () => ipcRenderer.invoke('update:check'),
     openReleases: () => ipcRenderer.invoke('app:openReleases'),
+    updateStatus: () => ipcRenderer.invoke('update:status'),
+    updateInstall: () => ipcRenderer.invoke('update:install'),
+    updateDownload: () => ipcRenderer.invoke('update:download'),
+    updateSetAuto: (on) => ipcRenderer.invoke('update:setAuto', on),
+    onUpdateStatus: (cb) => ipcRenderer.on('update:status', (e, s) => cb(s)),
     exportDiagnostics: () => ipcRenderer.invoke('diagnostics:export'),
     backupExport: (json, name) => ipcRenderer.invoke('backup:export', json, name),
     backupImport: () => ipcRenderer.invoke('backup:import')

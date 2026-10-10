@@ -82,3 +82,72 @@ test('忽略没有 gates / 4h 未结算 / 方向非法的记录', () => {
   ];
   assert.equal(plain(E.faAttribution(recs)).total, 1);
 });
+
+// ---------- 随机基线 ----------
+function mk(dir, up, gated, pct, btcPct) {
+  const hit = dir === 'long' ? up : !up;
+  return { ts: ++id, dir, gated: gated !== false, gates: {}, r4h: { hit, pct: pct === undefined ? (up ? 1 : -1) : pct, btcPct } };
+}
+
+test('faBaseline：方向判断完全正确 → p 值很小；方向随机 → p 值不小', () => {
+  // 一半上涨一半下跌，信号每次都猜对
+  const perfect = [].concat(rep(30, () => mk('long', true)), rep(30, () => mk('short', false)));
+  const b = plain(E.faBaseline(perfect, { rng: E.faRng(1), iters: 2000 }));
+  assert.equal(b.n, 60);
+  assert.equal(b.hitRate, 100);
+  assert.ok(b.pValue < 0.01, 'p=' + b.pValue);
+  assert.ok(Math.abs(b.randMean - 50) < 5, '随机方向命中率约 50%，实际 ' + b.randMean);
+  assert.equal(b.allLongRate, 50);
+  // 方向与涨跌无关：多空各半，涨跌各半，交叉均匀
+  const noise = [].concat(rep(15, () => mk('long', true)), rep(15, () => mk('long', false)), rep(15, () => mk('short', true)), rep(15, () => mk('short', false)));
+  const c = plain(E.faBaseline(noise, { rng: E.faRng(2), iters: 2000 }));
+  assert.equal(c.hitRate, 50);
+  assert.ok(c.pValue > 0.3, 'p=' + c.pValue);
+});
+
+test('faBaseline：只是赶上涨行情的「全做多」信号，命中率高但 p 值不显著', () => {
+  // 80% 的记录上涨，信号全部做多 → 命中 80%，但随机打乱（全是多单）也是 80%
+  const recs = [].concat(rep(40, () => mk('long', true)), rep(10, () => mk('long', false)));
+  const b = plain(E.faBaseline(recs, { rng: E.faRng(3), iters: 1000 }));
+  assert.equal(b.hitRate, 80);
+  assert.equal(b.allLongRate, 80);
+  assert.equal(b.randMean, 80);
+  assert.ok(b.pValue > 0.5, '没有方向选择可言：p=' + b.pValue);
+});
+
+test('faBaseline：只统计放行、相对 BTC 超额（空单取反）', () => {
+  const recs = [mk('long', true, true, 3, 1), mk('short', false, true, -2, -4), mk('long', true, false, 5, 0), mk('long', false, true, -1)];
+  const b = plain(E.faBaseline(recs, { onlyPassed: true, rng: E.faRng(4), iters: 100 }));
+  assert.equal(b.n, 3);
+  assert.equal(b.excessN, 2, '缺 btcPct 的记录不计入超额');
+  // 多单 3−1 = +2；空单 −(−2 − (−4)) = −2 → 平均 0，跑赢 50%
+  assert.equal(b.excessAvg, 0);
+  assert.equal(b.excessHit, 50);
+  assert.equal(plain(E.faBaseline([], {})).n, 0);
+});
+
+// ---------- 行情状态 ----------
+test('faRegimeOf：三个维度的分类', () => {
+  assert.deepEqual(plain(E.faRegimeOf({ marketState: '趋势明确', indicators: { bbWidth: '2.1' } }, { adx: 30, score: 70 })), { state: 'trend', btc: 'up', vol: 'low' });
+  assert.deepEqual(plain(E.faRegimeOf({ marketState: '震荡市', indicators: { bbWidth: '9' } }, { adx: 30, score: 40 })), { state: 'range', btc: 'down', vol: 'high' });
+  assert.deepEqual(plain(E.faRegimeOf({ marketState: '弱趋势', indicators: { bbWidth: '--' } }, { adx: 20, score: 80 })), { state: 'weak', btc: 'flat', vol: 'mid' });
+  assert.deepEqual(plain(E.faRegimeOf({}, null)), { state: 'weak', btc: 'flat', vol: 'mid' });
+});
+
+test('faRegimeStats / faWeakRegimes：样本足够且区间上限 <50% 才算显著偏弱', () => {
+  // 每个「该币状态」配不同的 BTC 环境 / 波动，避免其他维度被同一批记录带偏
+  const DIM = { range: ['down', 'low'], trend: ['up', 'high'], weak: ['flat', 'mid'] };
+  const R = (state, hit) => ({ ts: ++id, dir: 'long', gated: true, gates: {}, regime: { state, btc: DIM[state][0], vol: DIM[state][1] }, r4h: { hit, pct: hit ? 1 : -1 } });
+  const recs = [].concat(rep(40, (_, i) => R('range', i < 8)), rep(40, (_, i) => R('trend', i < 24)), rep(10, () => R('weak', false)));
+  const st = plain(E.faRegimeStats(recs));
+  const state = st.find((d) => d.key === 'state');
+  const row = (v) => state.rows.find((r) => r.value === v);
+  assert.equal(row('range').weak, true, '40 笔命中 20% → 显著偏弱');
+  assert.equal(row('trend').weak, false);
+  assert.equal(row('weak').weak, false, '只有 10 笔，样本不足');
+  const w = E.faWeakRegimes(E.faRegimeStats(recs), { state: 'range', btc: 'up', vol: 'high' });
+  assert.equal(w.length, 1);
+  assert.match(w[0], /震荡市（4h 命中 20%，n=40）/);
+  assert.deepEqual(plain(E.faWeakRegimes(E.faRegimeStats(recs), { state: 'trend', btc: 'up', vol: 'high' })), []);
+  assert.equal(E.faWeakRegimes(E.faRegimeStats(recs), { state: 'range', btc: 'down', vol: 'low' }).length, 3, '三个维度都偏弱');
+});

@@ -446,7 +446,7 @@ body {
 .linked-detail-head button { background: none; border: 1px solid var(--border-soft); border-radius: var(--r-pill); color: var(--accent-text); cursor: pointer; font-size: var(--fs-xs); padding: 3px 10px; }
 .linked-detail-head button:hover { border-color: var(--accent-line); }
 .linked-detail-sub { padding: 7px 12px 3px; font-size: var(--fs-xs); color: var(--text-muted); }
-.linked-row { display: grid; grid-template-columns: 1.5fr .9fr .9fr .8fr .8fr 1.1fr .7fr; gap: var(--sp-2); align-items: center; padding: 7px 12px; font-size: var(--fs-sm); color: var(--text-secondary); border-bottom: 1px solid var(--border-soft); }
+.linked-row { display: grid; grid-template-columns: 1.4fr .9fr .9fr .75fr .75fr .8fr 1.1fr .75fr 1fr .6fr; gap: var(--sp-2); align-items: center; padding: 7px 12px; font-size: var(--fs-sm); color: var(--text-secondary); border-bottom: 1px solid var(--border-soft); }
 .linked-row:last-child { border-bottom: none; }
 .linked-row.head { font-size: var(--fs-xs); color: var(--text-muted); background: var(--bg-primary); }
 .linked-row .sym { color: var(--text-primary); font-weight: 600; }
@@ -1050,6 +1050,8 @@ body {
 .ai-explain-head { display: flex; align-items: center; gap: var(--sp-2); font-weight: 600; font-size: var(--fs-sm); margin-bottom: 6px; }
 .ai-explain-text { font-size: var(--fs-sm); line-height: 1.8; color: var(--text-primary); }
 .ai-explain-meta { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
+tr.clickable, .sr-row.clickable { cursor: pointer; }
+tr.clickable:hover td, .sr-row.clickable:hover { background: var(--bg-primary); }
 .fa-wrap { margin: 0 0 var(--sp-4); }
 .fa-wrap .nt td, .fa-wrap .nt th { white-space: nowrap; }
 .fa-dim { color: var(--text-muted); font-size: 11px; }
@@ -1074,6 +1076,7 @@ body {
     <button class="rail-item" data-view="recommend" onclick="showView('recommend')"><span class="ri-ico">🤖</span>AI 推荐</button>
     <button class="rail-item" data-view="analysis" onclick="showView('analysis')"><span class="ri-ico">🕯️</span>技术分析</button>
     <button class="rail-item" data-view="linkage" onclick="showView('linkage')"><span class="ri-ico">🕸️</span>联动全景</button>
+    <button class="rail-item" data-view="radar" onclick="showView('radar')"><span class="ri-ico">📡</span>市场雷达</button>
     <button class="rail-item" data-view="screener" onclick="showView('screener')"><span class="ri-ico">🔎</span>选币扫描</button>
     <button class="rail-item" data-view="alerts" onclick="showView('alerts')"><span class="ri-ico">⏰</span>价格预警<span class="rail-badge" id="alertBadge" style="display:none">0</span></button>
     <button class="rail-item" data-view="mine" onclick="showView('mine')"><span class="ri-ico">💼</span>持仓与复盘</button>
@@ -1149,6 +1152,7 @@ body {
           <button class="time-btn" data-range="4h">4h</button>
           <button class="time-btn" data-range="1d">1d</button>
           <button class="time-btn" data-range="1w">1w</button>
+          <button class="btn-ghost tb-export" id="sigMarkToggle" onclick="toggleSignalMarks()" title="在 K 线上标出该币历史推荐信号（绿 = 4h 后方向命中，红 = 未中，灰 = 待结算；「拦」= 被门控拦截）与模拟跟踪">信号标注</button>
           <button class="btn-ghost tb-export" onclick="exportChartPng()" title="把当前主图导出为 PNG（按图表当前尺寸导出，窗口开大一点图更清晰）">导出图片</button></div>
           <div id="tvChart" class="chart-container"></div>
         </div>
@@ -1219,14 +1223,17 @@ body {
       <div id="alertListWrap"></div>
     </div></section>
     <section id="view-mine" class="view"><div class="container">
-      <div class="mine-notice">这里是<b>本地记账本</b>，不是交易界面：把你自己真实做过的单子手动记进来做复盘对照。<b>不连接任何交易所账户、不能下单、不会自动交易</b>，数据只存在你这台电脑上。</div>
+      <div class="mine-notice">这里是<b>本地记账本</b>，不是交易界面：把你自己真实做过的单子记进来做复盘对照。<b>不能下单、不会自动交易</b>；「真实成交」可选用<b>仅读取权限</b>的 API Key 导入成交记录，数据只存在你这台电脑上。</div>
       <div class="ana-tabs" id="mineTabs">
         <button class="ana-tab active" data-mpane="m_port" onclick="switchMinePane('m_port')">组合持仓</button>
         <button class="ana-tab" data-mpane="m_journal" onclick="switchMinePane('m_journal')">交易日志</button>
+        <button class="ana-tab" data-mpane="m_fills" onclick="switchMinePane('m_fills')">真实成交</button>
       </div>
       <div class="ana-pane active" id="m_port"><div id="portWrap"></div></div>
       <div class="ana-pane" id="m_journal"><div id="journalWrap"></div></div>
+      <div class="ana-pane" id="m_fills"><div id="fillsWrap"></div></div>
     </div></section>
+    <section id="view-radar" class="view"><div class="container"><div id="radarWrap"></div></div></section>
     <section id="view-settings" class="view"><div class="container">
       <div class="section-header"><h2 class="section-title">设置</h2></div>
       <div id="settingsWrap"><div class="empty-note">加载中…</div></div>
@@ -1247,8 +1254,14 @@ body {
   <script src="lib/shadow-model.js"></script>
   <script src="lib/portfolio-risk.js"></script>
   <script src="lib/fwd-attribution.js"></script>
+  <script src="lib/signal-marks.js"></script>
+  <script src="lib/paper-track.js"></script>
+  <script src="lib/radar.js"></script>
+  <script src="lib/fills.js"></script>
   <script src="lib/inline-handlers.js"></script>
   <script src="app.js"></script>
   <script src="settings.js"></script>
+  <script src="radar.js"></script>
+  <script src="fills-view.js"></script>
 
 </html>
