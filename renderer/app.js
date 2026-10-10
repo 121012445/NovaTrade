@@ -667,7 +667,8 @@ function recordFwdSignals(analyses, skipShortSyms, skipLongSyms, sellGateDetail,
     rec.ver = SCORING_VERSION;
     rec.gcfg = Object.keys(G).filter(function (k) { return G[k]; }).join(",");   // 当时开启了哪些门控
     if (a.riskReward) { rec.sl = a.riskReward.stopLoss; rec.tp = a.riskReward.tps && a.riskReward.tps[0] ? a.riskReward.tps[0].price : a.riskReward.takeProfit; }
-    rec.btc = (allPrices && allPrices.BTCUSDT) || null;   // BTC 同期价格，结算时用来算相对 BTC 的超额收益
+    rec.btc = (allPrices && allPrices.BTCUSDT) || null;
+    rec.regime = faRegimeOf(a, window.__btcRegime);       // 当时的行情状态（见 lib/fwd-attribution.js）   // BTC 同期价格，结算时用来算相对 BTC 的超额收益
     rec.feat = a.feat || null;                         // 影子模型的训练特征（见 lib/shadow-model.js）
     rec.dv = a.dv ? a.dv.s : null;                     // 衍生品倾向（未经验证，仅用于事后对比）
     fwdRecords.push(rec);
@@ -2149,6 +2150,38 @@ function baselineHtml() {
     '「全做多 / 全做空」反映这段时间的大盘漂移：如果实际命中率只是接近「全做多」，说明只是赶上了上涨行情。「相对 BTC 超额」把大盘涨跌扣掉，只看选币本身。</div></div>';
 }
 window.baselineHtml = baselineHtml;
+// 按行情状态分组的命中率
+var REGIME_GUARD_KEY = "novatrade_regime_guard";
+function regimeGuardOn() { try { return localStorage.getItem(REGIME_GUARD_KEY) === "1"; } catch (e) { return false; } }
+function setRegimeGuard(on) { try { localStorage.setItem(REGIME_GUARD_KEY, on ? "1" : "0"); } catch (e) {} }
+window.regimeGuardOn = regimeGuardOn; window.setRegimeGuard = setRegimeGuard;
+var __regimeCache = { at: 0, n: -1, v: null };
+function regimeStatsCached() {
+  var n = (fwdRecords || []).length;
+  if (__regimeCache.v && __regimeCache.n === n && Date.now() - __regimeCache.at < 60000) return __regimeCache.v;
+  __regimeCache = { at: Date.now(), n: n, v: faRegimeStats((fwdRecords || []).filter(recInScope), { onlyPassed: true }) };
+  return __regimeCache.v;
+}
+function regimeHtml() {
+  if (typeof faRegimeStats !== "function") return "";
+  var dims = faRegimeStats((fwdRecords || []).filter(recInScope));
+  var total = dims[0].rows.reduce(function (s, r) { return s + (r.stats.n || 0); }, 0);
+  if (!total) return "";
+  var pct = function (v) { return v === null || v === undefined || !isFinite(v) ? "--" : v.toFixed(0) + "%"; };
+  var body = dims.map(function (d) {
+    return '<tr><th colspan="5" style="text-align:left">' + escapeHtml(d.label) + '</th></tr>' + d.rows.map(function (r) {
+      var s2 = r.stats;
+      if (!s2.n) return '<tr><td>' + escapeHtml(r.label) + '</td><td>0</td><td colspan="3" class="fa-dim">无记录</td></tr>';
+      return '<tr><td>' + escapeHtml(r.label) + '</td><td>' + s2.n + '</td><td>' + pct(s2.h4Rate) + ' <span class="fa-dim">（' + s2.h4Ci.lo.toFixed(0) + '–' + s2.h4Ci.hi.toFixed(0) + '）</span></td>' +
+        '<td><span class="' + (s2.avgRet4h >= 0 ? "up" : "down") + '">' + (s2.avgRet4h >= 0 ? "+" : "") + s2.avgRet4h.toFixed(2) + '%</span></td>' +
+        '<td>' + (r.weak ? '<span class="bt-tag bad">显著偏弱</span>' : s2.n < 30 ? '<span class="fa-dim">样本不足</span>' : '') + '</td></tr>';
+    }).join("");
+  }).join("");
+  return '<div class="fa-wrap"><div class="mini-title">按行情状态分组（' + total + ' 条，含被拦截）</div><div class="nt-wrap"><table class="nt"><thead><tr><th>状态</th><th>笔数</th><th>4h 命中（95% 区间）</th><th>4h 方向收益</th><th></th></tr></thead><tbody>' + body + '</tbody></table></div>' +
+    '<div class="size-note">「显著偏弱」= 样本 ≥30 且命中率区间上限低于 50%。可在「设置 → 门控开关」里开启「在显著偏弱的行情状态下暂停信号」（按放行信号统计）。' +
+    '该币状态：ADX&gt;25 为趋势明确、&lt;20 为震荡市；BTC 环境：ADX&gt;25 且评分 ≥65 为上升、&lt;45 为下降；波动：布林带宽 &lt;3% 低、&gt;8% 高。</div></div>';
+}
+window.regimeHtml = regimeHtml;
 function gateAttributionHtml() {
   if (typeof faAttribution !== "function") return "";
   var A = faAttribution((fwdRecords || []).filter(recInScope));
@@ -2190,7 +2223,7 @@ function renderFwdLedger() {
   const rs = ledgerRows();
   const settled = all.filter(r => r.r4h).length;
   const expiredN = all.filter(r => r.expired && !r.r4h).length;
-  const head = baselineHtml() + gateAttributionHtml() + ledgerFiltersHtml() +
+  const head = baselineHtml() + gateAttributionHtml() + regimeHtml() + ledgerFiltersHtml() +
     "<div class=\"vp-note\" style=\"margin-bottom:10px\">共 " + all.length + " 条信号（已结算 " + settled + "，待结算 " + (all.length - settled - expiredN) + (expiredN ? "，无数据 " + expiredN : "") + "）；" +
     "「被门控拦下的」= 记录了但当时风控门控没放行，用来对比“记了但没做”的口径质量。点任意一行可回到该币技术分析。</div>";
   if (rs.length === 0) { box.innerHTML = head + "<div class=\"linked-empty\">该筛选下暂无记录。</div>"; return; }
@@ -3478,7 +3511,10 @@ function renderRecommendCard(c, quality) {
   const lowConfidence = c.confidence < MIN_ACTION_CONFIDENCE;
   const gateBlocked = isVetoed(c);
   const performanceBlocked = !quality || !quality.actionable;
-  const tradeBlocked = lowConfidence || gateBlocked || performanceBlocked;
+  // 可选：当前行情状态在历史上显著偏弱时暂停（默认关闭，见设置 → 门控开关）
+  const weakRegimes = regimeGuardOn() ? faWeakRegimes(regimeStatsCached(), faRegimeOf(c, window.__btcRegime)) : [];
+  const regimeBlocked = weakRegimes.length > 0;
+  const tradeBlocked = lowConfidence || gateBlocked || performanceBlocked || regimeBlocked;
   const direction = isBuy ? "偏多" : "偏空";
   const actionLabel = tradeBlocked ? direction + " · 暂不交易" : (isBuy ? "关注做多" : "关注做空");
   const actionClass = tradeBlocked ? "hold" : c.badge;
@@ -3486,6 +3522,7 @@ function renderRecommendCard(c, quality) {
   if (performanceBlocked) blockReasons.push(quality ? quality.label : "前向验证未达标");
   if (lowConfidence) blockReasons.push("置信度低于 " + MIN_ACTION_CONFIDENCE + "%");
   if (gateBlocked) blockReasons.push("风险门控已触发");
+  if (regimeBlocked) blockReasons.push("当前行情状态历史表现显著偏弱：" + weakRegimes.join("、"));
   const updated = new Date(c.fetchedAt || Date.now()).toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"});
   const rr = c.riskReward;
   const entry = Number(c.price);

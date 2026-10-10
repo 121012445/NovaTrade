@@ -79,6 +79,7 @@
         return '<div class="set-row"><label class="nf-check"><input type="checkbox" data-gate="' + x[0] + '"' + (g[x[0]] !== false ? " checked" : "") +
           ' onchange="settingsSaveGates()"><span><b>' + esc(x[1]) + '</b> <span class="set-note">' + esc(x[2]) + '</span></span></label></div>';
       }).join("") +
+      '<div class="set-row"><label class="nf-check"><input type="checkbox" onchange="settingsToggleRegime(this.checked)"' + (window.regimeGuardOn && window.regimeGuardOn() ? " checked" : "") + '><span><b>在显著偏弱的行情状态下暂停信号</b> <span class="set-note">某个行情状态（如「震荡市」「BTC 下降」）累计 ≥30 条放行信号且 4h 命中率区间上限 &lt;50% 时，该状态下的推荐显示为「暂不交易」。默认关闭。</span></span></label></div>' +
       '<div class="set-row"><button class="btn-ghost" onclick="settingsResetGates()">全部恢复默认（开启）</button></div>' +
       '<div id="gateMsg" class="set-result"></div></div>';
   }
@@ -89,6 +90,7 @@
     var off = Object.keys(out).filter(function (k) { return !out[k]; });
     msg("gateMsg", off.length ? "已关闭 " + off.length + " 道门控，下一轮推荐生效" : "全部门控已开启", true);
   };
+  window.settingsToggleRegime = function (on) { window.setRegimeGuard(!!on); toast(on ? "已开启：显著偏弱的行情状态下暂停信号" : "已关闭行情状态暂停"); };
   window.settingsResetGates = function () { window.saveGateCfg({}); renderSettings(); toast("门控已全部恢复为开启"); };
 
   function llmCardHtml() {

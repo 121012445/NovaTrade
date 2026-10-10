@@ -411,3 +411,17 @@ test('模拟跟踪：按现价入场、「暂不交易」信号需确认、实�
   await page.waitForFunction(() => /已结束 1 笔/.test(document.getElementById('linkedDetail').innerText), null, { timeout: 8000 });
   assert.deepEqual(errors, []);
 });
+
+test('行情状态：台账显示分组命中率；开启暂停后，处于显著偏弱状态的推荐显示为「暂不交易」并说明原因', { skip }, async () => {
+  const now = Date.now() - 6 * 3600e3;
+  // 所有状态组合都给 40 条命中率 10% 的放行记录 → 任何当前状态都会被判为显著偏弱
+  const recs = [];
+  for (const state of ['trend', 'range', 'weak']) for (let i = 0; i < 40; i++) recs.push({ ts: now - recs.length * 1000, symbol: 'ZUSDT', dir: 'long', score: 66, price: 1, gated: true, gates: {}, resolved: true, ver: '2', regime: { state, btc: 'flat', vol: 'mid' }, r1h: { hit: false, pct: -1 }, r4h: { hit: i < 4, pct: i < 4 ? 1 : -1 } });
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.setItem('novatrade_ledger_scope', 'current'); localStorage.setItem('novatrade_regime_guard', '1'); localStorage.removeItem('novatrade.recommend-snapshot.v1');`);
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => /按行情状态分组/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 30000 });
+  assert.match(await page.locator('#fwdLedger .fa-wrap:has-text("按行情状态分组")').innerText(), /显著偏弱/);
+  await page.waitForFunction(() => /当前行情状态历史表现显著偏弱/.test(document.getElementById('recommendGrid').innerText), null, { timeout: 30000 });
+  await page.evaluate(() => localStorage.setItem('novatrade_regime_guard', '0'));
+  assert.deepEqual(errors, []);
+});

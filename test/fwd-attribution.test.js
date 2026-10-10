@@ -125,3 +125,29 @@ test('faBaseline：只统计放行、相对 BTC 超额（空单取反）', () =>
   assert.equal(b.excessHit, 50);
   assert.equal(plain(E.faBaseline([], {})).n, 0);
 });
+
+// ---------- 行情状态 ----------
+test('faRegimeOf：三个维度的分类', () => {
+  assert.deepEqual(plain(E.faRegimeOf({ marketState: '趋势明确', indicators: { bbWidth: '2.1' } }, { adx: 30, score: 70 })), { state: 'trend', btc: 'up', vol: 'low' });
+  assert.deepEqual(plain(E.faRegimeOf({ marketState: '震荡市', indicators: { bbWidth: '9' } }, { adx: 30, score: 40 })), { state: 'range', btc: 'down', vol: 'high' });
+  assert.deepEqual(plain(E.faRegimeOf({ marketState: '弱趋势', indicators: { bbWidth: '--' } }, { adx: 20, score: 80 })), { state: 'weak', btc: 'flat', vol: 'mid' });
+  assert.deepEqual(plain(E.faRegimeOf({}, null)), { state: 'weak', btc: 'flat', vol: 'mid' });
+});
+
+test('faRegimeStats / faWeakRegimes：样本足够且区间上限 <50% 才算显著偏弱', () => {
+  // 每个「该币状态」配不同的 BTC 环境 / 波动，避免其他维度被同一批记录带偏
+  const DIM = { range: ['down', 'low'], trend: ['up', 'high'], weak: ['flat', 'mid'] };
+  const R = (state, hit) => ({ ts: ++id, dir: 'long', gated: true, gates: {}, regime: { state, btc: DIM[state][0], vol: DIM[state][1] }, r4h: { hit, pct: hit ? 1 : -1 } });
+  const recs = [].concat(rep(40, (_, i) => R('range', i < 8)), rep(40, (_, i) => R('trend', i < 24)), rep(10, () => R('weak', false)));
+  const st = plain(E.faRegimeStats(recs));
+  const state = st.find((d) => d.key === 'state');
+  const row = (v) => state.rows.find((r) => r.value === v);
+  assert.equal(row('range').weak, true, '40 笔命中 20% → 显著偏弱');
+  assert.equal(row('trend').weak, false);
+  assert.equal(row('weak').weak, false, '只有 10 笔，样本不足');
+  const w = E.faWeakRegimes(E.faRegimeStats(recs), { state: 'range', btc: 'up', vol: 'high' });
+  assert.equal(w.length, 1);
+  assert.match(w[0], /震荡市（4h 命中 20%，n=40）/);
+  assert.deepEqual(plain(E.faWeakRegimes(E.faRegimeStats(recs), { state: 'trend', btc: 'up', vol: 'high' })), []);
+  assert.equal(E.faWeakRegimes(E.faRegimeStats(recs), { state: 'range', btc: 'down', vol: 'low' }).length, 3, '三个维度都偏弱');
+});

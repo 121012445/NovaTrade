@@ -131,3 +131,52 @@ function faBaseline(records, opts) {
     excessHit: ex.length ? ex.filter(function (x) { return x > 0; }).length / ex.length * 100 : null
   };
 }
+
+// ===== 按行情状态分组 =====
+// 很多规则只在某一种行情里有效（例如趋势跟随在震荡市里反复止损）。每条信号记录当时的三个维度：
+//   state：该币自身的市场状态（ADX>25 趋势明确 / ADX<20 震荡市 / 其余弱趋势）
+//   btc：BTC 环境（ADX>25 且评分≥65 上升 / ADX>25 且评分<45 下降 / 其余无明确趋势）
+//   vol：波动（布林带宽占中轨 <3% 低 / 3–8% 中 / >8% 高）
+var FA_REGIME_DIMS = [
+  { key: "state", label: "该币状态", values: { trend: "趋势明确", range: "震荡市", weak: "弱趋势" } },
+  { key: "btc", label: "BTC 环境", values: { up: "BTC 上升", down: "BTC 下降", flat: "BTC 无明确趋势" } },
+  { key: "vol", label: "波动", values: { low: "低波动", mid: "中等波动", high: "高波动" } }
+];
+
+// a：多周期合并分析结果；btc：window.__btcRegime（{ score, adx }）
+function faRegimeOf(a, btc) {
+  var ms = a && a.marketState;
+  var state = ms === "趋势明确" ? "trend" : ms === "震荡市" ? "range" : "weak";
+  var b = "flat";
+  if (btc && isFinite(btc.adx) && btc.adx > 25) b = btc.score >= SIGNAL_LONG_MIN ? "up" : btc.score < SIGNAL_SHORT_MAX ? "down" : "flat";
+  var bw = parseFloat(a && a.indicators && a.indicators.bbWidth);
+  var vol = !isFinite(bw) ? "mid" : bw < 3 ? "low" : bw > 8 ? "high" : "mid";
+  return { state: state, btc: b, vol: vol };
+}
+
+// 返回 [{ key, label, rows: [{ value, label, stats, weak }] }]。weak = 样本 ≥30 且 4h 命中率区间上限 < 50%
+function faRegimeStats(records, opts) {
+  var o = opts || {};
+  var rs = (records || []).filter(function (r) {
+    return r && r.regime && r.r4h && typeof r.r4h.hit === "boolean" && isFinite(r.r4h.pct) && (!o.onlyPassed || r.gated !== false);
+  });
+  return FA_REGIME_DIMS.map(function (d) {
+    return {
+      key: d.key, label: d.label,
+      rows: Object.keys(d.values).map(function (v) {
+        var st = faStats(rs.filter(function (r) { return r.regime[d.key] === v; }));
+        return { value: v, label: d.values[v], stats: st, weak: !!(st.n >= 30 && st.h4Ci && st.h4Ci.hi < 50) };
+      })
+    };
+  });
+}
+
+// 当前行情状态里，有没有哪个维度在历史上显著偏弱。返回偏弱的标签列表（空数组 = 没有）
+function faWeakRegimes(stats, regime) {
+  var out = [];
+  (stats || []).forEach(function (d) {
+    var row = d.rows.find(function (x) { return regime && x.value === regime[d.key]; });
+    if (row && row.weak) out.push(row.label + "（4h 命中 " + row.stats.h4Rate.toFixed(0) + "%，n=" + row.stats.n + "）");
+  });
+  return out;
+}
