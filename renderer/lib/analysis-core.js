@@ -263,7 +263,11 @@ function detectAdvancedPatterns(ohlc) {
 }
 
 function calcRiskReward(analysis, ohlc, livePrice) {
-  if (!analysis || !ohlc || ohlc.length < 20) return null;
+  if (!analysis) return null;
+  // 否决标记每次都按「本次评分 + 本次数据」重新判定。多周期合并结果是从 4h 单周期结果复制来的，
+  // 不先清除就会带着 4h 单独评分时的旧标记，把按合并评分本该放行的信号错误拦截。
+  analysis.overheatVeto = false; analysis.nearSupportVeto = false; analysis.stopCapVeto = false;
+  if (!ohlc || ohlc.length < 20) return null;
   const last = ohlc[ohlc.length-1];
   // ohlc 为已收盘 K 线（结构位 / ATR 的来源）；livePrice 为此刻的最新价，缺省时退回最后一根收盘价。
   // 入场价必须是「现在能成交的价格」，否则 4h 基底下入场价最多会落后 4 小时。
