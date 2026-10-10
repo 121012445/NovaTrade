@@ -189,7 +189,9 @@ function startRealtime() {
     onMessage: function (raw) {
       var msgs;
       try { msgs = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (e) { return; }
-      if (Array.isArray(msgs) && applyMiniTickers(allCoins, allPrices, msgs, rtIndex) > 0) rtDirty = true;
+      if (!Array.isArray(msgs)) return;
+      if (applyMiniTickers(allCoins, allPrices, msgs, rtIndex) > 0) rtDirty = true;
+      if (window.radarIngest) { try { window.radarIngest(msgs); } catch (e) {} }   // 市场雷达采样（radar.js）
     },
     onStatus: function () { try { klinePaintFresh(); } catch (e) {} }
   });
@@ -962,7 +964,7 @@ async function selectCoin(symbol) {
   }
 }
 // ===== 视图路由（桌面外壳） =====
-const VIEW_TITLES = { market: "市场概览", recommend: "AI 智能推荐", analysis: "AI 深度分析", linkage: "联动全景", screener: "选币扫描", alerts: "价格预警", mine: "持仓与复盘", settings: "设置" };
+const VIEW_TITLES = { market: "市场概览", recommend: "AI 智能推荐", analysis: "AI 深度分析", linkage: "联动全景", screener: "选币扫描", radar: "市场雷达", alerts: "价格预警", mine: "持仓与复盘", settings: "设置" };
 function showView(name) {
   window.__currentView = name;
   document.querySelectorAll(".views .view").forEach(v => v.classList.toggle("active", v.id === "view-" + name));
@@ -983,6 +985,7 @@ function showView(name) {
   // 2026-10-09 第十批：价格预警 / 我的交易（同样是懒渲染）
   if (name === "alerts") { try { renderAlerts(); } catch(e) { console.error("[app] alerts view:", e); } }
   if (name === "mine") { try { renderMine(); } catch(e) { console.error("[app] mine view:", e); } }
+  if (name === "radar") { try { if (window.renderRadar) renderRadar(); } catch(e) { console.error("[app] radar view:", e); } }
   if (name === "settings") { try { if (window.renderSettings) renderSettings(); } catch(e) { console.error("[app] settings view:", e); } }
 }
 window.showView = showView;

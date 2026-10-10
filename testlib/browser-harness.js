@@ -69,6 +69,8 @@ const MOCK_SCRIPT = `
       return { symbol: sym, premium: { lastFundingRate: '0.0004', markPrice: '100', nextFundingTime: Date.now() + 3600e3 },
         oi: oi, lsAccount: [{ longShortRatio: '1.1' }], lsTop: [{ longShortRatio: '1.4' }], taker: [{ buySellRatio: '1.08' }] };
     },
+    premiumAll: async function () { rec('premiumAll', arguments); return syms.map(function (s, i) { return { symbol: s + 'USDT', lastFundingRate: String((i - 4) * 0.0002), markPrice: '1' }; }); },
+    derivLite: async function (s) { rec('derivLite', arguments); var k = s.charCodeAt(0) % 7; return { symbol: s, oi: [{ sumOpenInterestValue: '100' }, { sumOpenInterestValue: String(100 + k * 5) }], ls: [{ longShortRatio: String(0.8 + k * 0.1) }] }; },
     getDataSource: async function () { return window.__dataSourceMock || { name: 'binance', at: Date.now() }; },
     getHistory: async function (s, iv, bars) { rec('getHistory', arguments); return klines(s, iv, Math.min(bars, 3000)); },
     fng: async function () { return { __error: 'mock' }; },

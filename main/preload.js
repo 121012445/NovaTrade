@@ -18,7 +18,9 @@ try {
     getFuturesDepth: (symbol, limit) => ipcRenderer.invoke('binance:futuresDepth', symbol, limit),
     getAggTrades: (symbol, limit) => ipcRenderer.invoke('binance:aggTrades', symbol, limit),
     getHistory: (symbol, interval, bars) => ipcRenderer.invoke('history:get', symbol, interval, bars),
-    getDataSource: () => ipcRenderer.invoke('data:source')
+    getDataSource: () => ipcRenderer.invoke('data:source'),
+    premiumAll: () => ipcRenderer.invoke('binance:premiumAll'),
+    derivLite: (symbol) => ipcRenderer.invoke('deriv:lite', symbol)
   });
   contextBridge.exposeInMainWorld('electronAPI', {
     minimize: () => ipcRenderer.send('window:minimize'),

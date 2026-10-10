@@ -1050,6 +1050,8 @@ body {
 .ai-explain-head { display: flex; align-items: center; gap: var(--sp-2); font-weight: 600; font-size: var(--fs-sm); margin-bottom: 6px; }
 .ai-explain-text { font-size: var(--fs-sm); line-height: 1.8; color: var(--text-primary); }
 .ai-explain-meta { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
+tr.clickable, .sr-row.clickable { cursor: pointer; }
+tr.clickable:hover td, .sr-row.clickable:hover { background: var(--bg-primary); }
 .fa-wrap { margin: 0 0 var(--sp-4); }
 .fa-wrap .nt td, .fa-wrap .nt th { white-space: nowrap; }
 .fa-dim { color: var(--text-muted); font-size: 11px; }
@@ -1074,6 +1076,7 @@ body {
     <button class="rail-item" data-view="recommend" onclick="showView('recommend')"><span class="ri-ico">🤖</span>AI 推荐</button>
     <button class="rail-item" data-view="analysis" onclick="showView('analysis')"><span class="ri-ico">🕯️</span>技术分析</button>
     <button class="rail-item" data-view="linkage" onclick="showView('linkage')"><span class="ri-ico">🕸️</span>联动全景</button>
+    <button class="rail-item" data-view="radar" onclick="showView('radar')"><span class="ri-ico">📡</span>市场雷达</button>
     <button class="rail-item" data-view="screener" onclick="showView('screener')"><span class="ri-ico">🔎</span>选币扫描</button>
     <button class="rail-item" data-view="alerts" onclick="showView('alerts')"><span class="ri-ico">⏰</span>价格预警<span class="rail-badge" id="alertBadge" style="display:none">0</span></button>
     <button class="rail-item" data-view="mine" onclick="showView('mine')"><span class="ri-ico">💼</span>持仓与复盘</button>
@@ -1228,6 +1231,7 @@ body {
       <div class="ana-pane active" id="m_port"><div id="portWrap"></div></div>
       <div class="ana-pane" id="m_journal"><div id="journalWrap"></div></div>
     </div></section>
+    <section id="view-radar" class="view"><div class="container"><div id="radarWrap"></div></div></section>
     <section id="view-settings" class="view"><div class="container">
       <div class="section-header"><h2 class="section-title">设置</h2></div>
       <div id="settingsWrap"><div class="empty-note">加载中…</div></div>
@@ -1250,8 +1254,10 @@ body {
   <script src="lib/fwd-attribution.js"></script>
   <script src="lib/signal-marks.js"></script>
   <script src="lib/paper-track.js"></script>
+  <script src="lib/radar.js"></script>
   <script src="lib/inline-handlers.js"></script>
   <script src="app.js"></script>
   <script src="settings.js"></script>
+  <script src="radar.js"></script>
 
 </html>

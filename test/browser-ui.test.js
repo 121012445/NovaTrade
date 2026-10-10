@@ -425,3 +425,32 @@ test('行情状态：台账显示分组命中率；开启暂停后，处于显�
   await page.evaluate(() => localStorage.setItem('novatrade_regime_guard', '0'));
   assert.deepEqual(errors, []);
 });
+
+test('市场雷达：推送数据进入异动榜并触发异动提醒；资金面排行显示费率 / 持仓量 / 多空比榜单', { skip }, async () => {
+  const { page, errors } = await open("localStorage.setItem('novatrade_radar_cfg', JSON.stringify({ on: true, pct: 2, cool: 30 }));");
+  await page.evaluate(`${RT}[0].onopen()`);
+  // 伪造过去 6 分钟的采样：ETH 从 100 涨到 104
+  await page.evaluate(() => {
+    const now = Date.now();
+    window.__radar.s = { ETHUSDT: [], SOLUSDT: [] };
+    for (let t = now - 6 * 60e3; t <= now; t += 10000) {
+      const k = (t - (now - 6 * 60e3)) / (6 * 60e3);
+      window.__radar.s.ETHUSDT.push([t, 100 + 4 * k, 288000 + k * 3000]);
+      window.__radar.s.SOLUSDT.push([t, 50, 1000]);
+    }
+  });
+  await page.click(`[onclick="showView('radar')"], [data-onclick="showView('radar')"]`);
+  await page.waitForFunction(() => /ETH/.test((document.getElementById('radarMovers') || {}).innerText || ''), null, { timeout: 8000 });
+  const first = await page.locator('#radarMovers tbody tr').first().innerText();
+  assert.match(first, /^ETH/);
+  assert.match(first, /\+3\.\d\d%/);
+  await page.waitForFunction(() => window.__calls.some((c) => c[0] === 'electronAPI.pushSend' && /ETH 5 分钟急涨/.test(JSON.stringify(c))), null, { timeout: 8000 });
+  await page.waitForFunction(() => /资金费率最高/.test(document.getElementById('radarDeriv').innerText) && /账户多空比最高/.test(document.getElementById('radarDeriv').innerText), null, { timeout: 15000 });
+  const d = await page.locator('#radarDeriv').innerText();
+  assert.match(d, /持仓量 24h 增长最多/);
+  assert.equal(await page.evaluate(() => window.__calls.filter((c) => c[0] === 'premiumAll').length), 1);
+  await page.click('#radarMovers tbody tr >> nth=0');
+  assert.equal(await page.evaluate(() => document.querySelector('.view.active').id), 'view-analysis');
+  await page.evaluate(() => localStorage.removeItem('novatrade_radar_cfg'));
+  assert.deepEqual(errors, []);
+});

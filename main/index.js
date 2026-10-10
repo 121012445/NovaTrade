@@ -674,6 +674,19 @@ ipcHandle('deriv:snapshot', async (e, symRaw, periodRaw, limit) => {
   return { symbol: sym, period: p, fetchedAt: Date.now(), premium, oi, lsAccount, lsTop, taker };
 });
 
+// ===== 市场雷达：全市场资金费率（一次请求取齐）+ 单币轻量衍生品数据（持仓量 24h、账户多空比）=====
+ipcHandle('binance:premiumAll', safe('premiumAll', () => binanceFuturesRequest('/fapi/v1/premiumIndex')));
+ipcHandle('deriv:lite', async (e, symRaw) => {
+  const sym = V.symbol(symRaw);
+  if (!sym) return bad('symbol');
+  const q = 'symbol=' + sym + '&period=1h&limit=25';
+  const [oi, ls] = await Promise.all([
+    derivOne('/futures/data/openInterestHist?' + q),
+    derivOne('/futures/data/globalLongShortAccountRatio?symbol=' + sym + '&period=1h&limit=1')
+  ]);
+  return { symbol: sym, oi, ls };
+});
+
 // ===== 2026-10-09 第十批：新数据源 =====
 // 【硬边界】本批全部为**只读**数据通道，不包含任何下单 / 撤单 / 资金划转能力。
 // 应用定位始终是"分析辅助工具"，不参与实盘交易。
