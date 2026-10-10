@@ -349,7 +349,8 @@ test('门控开关 + 评分版本：设置里关闭过热区立即生效；台�
   const mk = (i, ver, hit) => ({ ts: now - i * 60e3, symbol: 'AUSDT', dir: i % 2 ? 'long' : 'short', score: i % 2 ? 66 : 30, price: 1, gated: true, gates: {}, resolved: true, ver,
     r1h: { price: 1, pct: 0.1, hit }, r4h: { price: 1, pct: hit === (i % 2 === 1) ? 1 : -1, hit, btcPct: 0.2 } });
   const recs = [].concat(Array.from({ length: 40 }, (_, i) => mk(i, '2', i % 3 !== 0)), Array.from({ length: 10 }, (_, i) => mk(100 + i, undefined, false)));
-  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)};`);
+  // 同一浏览器上下文里的测试共享 localStorage：显式重置本测试依赖的设置
+  const { page, errors } = await open(`window.__fwdStore = ${JSON.stringify(recs)}; localStorage.setItem('novatrade_ledger_scope', 'current'); localStorage.removeItem('novatrade_gates_v1');`);
   await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
   await page.waitForFunction(() => /信号 vs 随机基线/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 15000 });
   // 启动时推荐扫描本身也会新增若干条当前版本的记录，所以期望值按页面里的实际记录数计算
@@ -377,5 +378,36 @@ test('门控开关 + 评分版本：设置里关闭过热区立即生效；台�
   assert.equal(await page.evaluate(() => SHORT_SCORE_MIN), 45);
   await page.click('button:has-text("全部恢复默认")');
   assert.equal(await page.evaluate(() => SHORT_SCORE_MIN), 39);
+  assert.deepEqual(errors, []);
+});
+
+test('模拟跟踪：按现价入场、「暂不交易」信号需确认、实时推送触及目标立即归档并显示净收益', { skip }, async () => {
+  const { page, errors } = await open("localStorage.removeItem('novatrade.linked-state.v1');");
+  await page.evaluate(`${RT}[0].onopen()`);
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => document.querySelectorAll('.recommend-card').length > 0 && !document.getElementById('recommendRefreshNote'), null, { timeout: 30000 });
+  const btn = page.locator('.recommend-card button:has-text("模拟跟踪")').first();
+  const card = page.locator('.recommend-card').first();
+  const sym = await card.getAttribute('data-coin');
+  const blocked = await card.evaluate((el) => el.classList.contains('low-trust'));
+  // 假行情里 24h 行情价与 K 线价不一致；真实环境两者一致。这里让现价等于卡片上的价格，否则会被（正确地）判为已越过止损
+  await page.evaluate((s) => { const g = window.__recGroups; const c = g.buy.concat(g.sell).find((x) => x.symbol === s); allCoins.find((x) => x.symbol === s).price = c.price; }, sym);
+  let asked = 0;
+  page.on('dialog', async (d) => { asked++; await d.accept(); });
+  await btn.click();
+  await page.waitForFunction((s) => (JSON.parse(localStorage.getItem('novatrade.linked-state.v1') || '{"tracks":[]}').tracks || []).some((t) => t.symbol === s), sym);
+  assert.equal(asked, blocked ? 1 : 0, '「暂不交易」信号应先弹确认');
+  const t = await page.evaluate((s) => JSON.parse(localStorage.getItem('novatrade.linked-state.v1')).tracks.find((x) => x.symbol === s), sym);
+  const live = await page.evaluate((s) => allCoins.find((c) => c.symbol === s).price, sym);
+  assert.equal(t.entry, live, '入场价 = 现价');
+  assert.equal(t.blocked, blocked);
+  // 推送一个越过目标的价格：1 秒内归档
+  const px = t.direction === 'long' ? t.target * 1.01 : t.target * 0.99;
+  await page.evaluate(`${RT}[0].onmessage({ data: JSON.stringify([{ s: '${sym}', c: '${px}', o: '${t.entry}', q: '1' }]) })`);
+  await page.waitForFunction((s) => JSON.parse(localStorage.getItem('novatrade.linked-state.v1')).tracks.find((x) => x.symbol === s).status === 'target', sym, { timeout: 5000 });
+  const done = await page.evaluate((s) => JSON.parse(localStorage.getItem('novatrade.linked-state.v1')).tracks.find((x) => x.symbol === s), sym);
+  assert.ok(Math.abs(done.net - (done.pnl - 0.12)) < 1e-9);
+  assert.ok(done.mfe >= done.pnl - 1e-9);
+  await page.waitForFunction(() => /已结束 1 笔/.test(document.getElementById('linkedDetail').innerText), null, { timeout: 8000 });
   assert.deepEqual(errors, []);
 });

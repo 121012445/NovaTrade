@@ -195,7 +195,7 @@ function startRealtime() {
   });
   rtClient.start();
   // 合并后的 UI 刷新做节流：预警每秒判一次；行情卡片 / 侧栏每 3 秒刷新一次
-  appInterval(async function () { if (rtDirty) { rtDirty = false; try { checkAlerts(); } catch (e) {} } }, 1000);
+  appInterval(async function () { if (rtDirty) { rtDirty = false; try { checkAlerts(); } catch (e) {} try { checkLinkedFeatures({ fast: true }); } catch (e) {} } }, 1000);
   appInterval(async function () { if (rtHealthy()) { try { renderMarket(currentFilter); renderSidebar(); } catch (e) {} } }, 3000);
 }
 window.startRealtime = startRealtime;
@@ -3252,6 +3252,9 @@ async function renderRecommendations() { const grid = document.getElementById("r
   // 收尾：最终一致性渲染（排序/截断/gate-note 均以全量数据为准）
   progressiveRender();
   try { notifyNewSignals(window.__recGroups && window.__recGroups.buy, window.__recGroups && window.__recGroups.sell, quality); } catch (e) {}
+  // 后台刷新完成：去掉「先显示上次结果，正在后台刷新」提示（此前会一直停在 100%），且不把提示存进快照
+  const __note = document.getElementById("recommendRefreshNote");
+  if (__note) __note.remove();
   saveRecommendationSnapshot(grid.innerHTML);
   renderLinkedSummary();
 }
@@ -3313,18 +3316,22 @@ function renderLinkedSummary() {
 function linkedTrackRow(t) {
   const isLong = t.direction === "long";
   const pnl = Number.isFinite(t.pnl) ? t.pnl : 0;
-  const cur = (Number.isFinite(t.current) && t.current > 0) ? t.current : t.entry;
+  const cur = (Number.isFinite(t.exit) && t.exit > 0) ? t.exit : (Number.isFinite(t.current) && t.current > 0) ? t.current : t.entry;
   const stLabel = t.status === "active" ? "跟踪中" : t.status === "target" ? "达目标" : t.status === "invalid" ? "已失效" : "已停止";
-  const sign = pnl >= 0 ? "+" : "";
+  const pc = (v) => Number.isFinite(v) ? `<span class="${v >= 0 ? "up" : "down"}">${v >= 0 ? "+" : ""}${v.toFixed(2)}%</span>` : `<span class="muted">--</span>`;
   const when = new Date(t.createdAt || Date.now()).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
   const op = t.status === "active"
     ? `<button type="button" onclick="cancelTrack('${escapeJsAttr(t.symbol)}','${t.direction}')">取消</button>`
     : `<span class="muted">—</span>`;
+  const ext = Number.isFinite(t.mfe) && t.v === 2 ? `<span title="持仓期间最大浮盈 / 最大浮亏">${pc(t.mfe)} / ${pc(t.mae)}</span>` : `<span class="muted">--</span>`;
   return `<div class="linked-row">
-    <span class="sym">${escapeHtml(t.symbol)}<em class="dir ${isLong ? "long" : "short"}">${isLong ? "多" : "空"}</em></span>
+    <span class="sym">${escapeHtml(t.symbol)}<em class="dir ${isLong ? "long" : "short"}">${isLong ? "多" : "空"}</em>${t.blocked ? '<em class="sc-tag down" title="加入时该信号标记为「暂不交易」">拦</em>' : ""}</span>
     <span>${formatPrice(t.entry)}</span>
     <span>${formatPrice(cur)}</span>
-    <span class="pnl ${pnl >= 0 ? "up" : "down"}">${sign}${pnl.toFixed(2)}%</span>
+    <span class="pnl">${pc(pnl)}</span>
+    <span class="pnl" title="扣除 ${(t.cost === undefined ? 0 : t.cost).toFixed(2)}% 成本">${t.v === 2 ? pc(t.net) : '<span class="muted">--</span>'}</span>
+    <span title="方向收益减去同期 BTC 涨跌（空单取反）">${pc(t.excess)}</span>
+    ${ext}
     <span class="st ${t.status}">${stLabel}</span>
     <span class="when">${when}</span>
     <span class="op">${op}</span>
@@ -3341,11 +3348,17 @@ function renderLinkedDetail(s) {
   // 界面上既不计入统计也不出现在明细里，看起来就像"数据凭空消失了"，其实一直存在 localStorage。
   const stopped = s.tracks.filter(t => t.status === "cancelled").sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0)).slice(0, 10);
   if (active.length === 0 && closed.length === 0 && stopped.length === 0) {
-    box.innerHTML = `<div class="linked-empty">暂无模拟跟踪。在推荐卡片点「模拟跟踪」即可跟踪后续走势：每 30 秒更新现价与浮盈，达到目标 / 触发止损自动归档。</div>`;
+    box.innerHTML = `<div class="linked-empty">暂无模拟跟踪。在推荐卡片点「模拟跟踪」即可跟踪后续走势：按现价入场，实时更新浮盈（扣成本后的净收益、相对 BTC 的超额、最大浮盈 / 浮亏），达到目标 / 触发止损自动归档。</div>`;
     return;
   }
-  let html = `<div class="linked-detail-head"><span>模拟跟踪明细 · 入场 / 现价 / 浮盈</span><button type="button" onclick="clearFinishedTracks()">清除已结束</button></div>`;
-  html += `<div class="linked-row head"><span>币种</span><span>入场</span><span>现价</span><span>浮盈</span><span>状态</span><span>加入时间</span><span>操作</span></div>`;
+  let html = `<div class="linked-detail-head"><span>模拟跟踪明细（成本按 ${PT_COST_PCT}% 计：往返手续费 + 滑点）</span><button type="button" onclick="clearFinishedTracks()">清除已结束</button></div>`;
+  const sum = ptSummary(s.tracks), sumOk = ptSummary(s.tracks, { excludeBlocked: true });
+  const f2 = (v) => Number.isFinite(v) ? (v >= 0 ? "+" : "") + v.toFixed(2) + "%" : "--";
+  if (sum.n) {
+    html += `<div class="linked-detail-sub">已结束 ${sum.n} 笔：达标 ${sum.targets} / 止损 ${sum.stops} · 胜率 ${sum.winRate.toFixed(0)}% · 平均净收益 ${f2(sum.avgNet)} · 平均相对 BTC ${f2(sum.avgExcess)}` +
+      (sum.blockedN ? ` · 其中 ${sum.blockedN} 笔是「暂不交易」信号；只看可交易信号：${sumOk.n} 笔，平均净收益 ${f2(sumOk.avgNet)}` : "") + `</div>`;
+  }
+  html += `<div class="linked-row head"><span>币种</span><span>入场</span><span>现价 / 出场</span><span>浮盈</span><span>净收益</span><span>相对BTC</span><span>最大浮盈 / 浮亏</span><span>状态</span><span>加入时间</span><span>操作</span></div>`;
   html += active.map(linkedTrackRow).join("");
   if (closed.length) { html += `<div class="linked-detail-sub">最近结束</div>` + closed.map(linkedTrackRow).join(""); }
   if (stopped.length) { html += `<div class="linked-detail-sub">已停止 / 已取消（${stopped.length}）</div>` + stopped.map(linkedTrackRow).join(""); }
@@ -3395,19 +3408,24 @@ function createPriceAlert(symbol, direction, price) {
   linkedToast(`${symbol} 已设置${direction === "long" ? "突破" : "跌破"}确认提醒：${formatPrice(triggerPrice)}`);
   renderRecommendations();
 }
-function togglePaperTrack(symbol, direction, entry, stopLoss, target) {
+function togglePaperTrack(symbol, direction, entry, stopLoss, target, blocked) {
   const s = loadLinkedState();
   const active = s.tracks.find(t => t.symbol === symbol && t.direction === direction && t.status === "active");
   if (active) {
     active.status = "cancelled"; active.closedAt = Date.now();
     linkedToast(`${symbol} 已停止模拟跟踪`);
   } else {
-    s.tracks.push({ symbol, direction, entry, stopLoss, target, current:entry, pnl:0, status:"active", createdAt:Date.now() });
-    linkedToast(`${symbol} 已加入模拟跟踪，不会发送真实订单`);
+    // 被门控 / 置信度 / 前向验证拦下的信号：先确认，并在跟踪记录上打标，汇总时可以分开看
+    if (blocked && !window.confirm(splitSymbol(symbol).base + " 这条信号标记为「暂不交易」（前向验证未达标 / 置信度不足 / 风险门控触发）。\n\n仍要模拟跟踪吗？")) return;
+    const coin = (allCoins || []).find(c => c.symbol === symbol);
+    const r = ptOpen({ symbol, direction, stopLoss, target, livePrice: coin ? coin.price : NaN, btcPrice: allPrices && allPrices.BTCUSDT, blocked: !!blocked, now: Date.now() });
+    if (!r.ok) { linkedToast(`${splitSymbol(symbol).base}：${r.reason}`); return; }
+    s.tracks.push(r.track);
+    linkedToast(`${symbol} 已加入模拟跟踪（入场按现价 ${formatPrice(r.track.entry)}），不会发送真实订单`);
   }
   saveLinkedState(s); renderLinkedSummary(); renderRecommendations();
 }
-function checkLinkedFeatures() {
+function checkLinkedFeatures(opts) {
   const s = loadLinkedState();
   let changed = false;
   const now = Date.now();
@@ -3418,16 +3436,23 @@ function checkLinkedFeatures() {
     const hit = a.direction === "long" ? coin.price >= a.triggerPrice : coin.price <= a.triggerPrice;
     if (hit) { a.status = "confirmed"; a.confirmedAt = now; a.confirmedPrice = coin.price; changed = true; linkedToast(`${a.symbol} 方向信号已确认，现价 ${formatPrice(coin.price)}`); pushNotify(`${a.symbol} 方向信号已确认`, `现价 ${formatPrice(coin.price)} · 触发价 ${formatPrice(a.triggerPrice)}`); }
   });
+  const btcNow = allPrices && allPrices.BTCUSDT;
   s.tracks.forEach(t => {
     if (t.status !== "active") return;
     const coin = allCoins.find(c => c.symbol === t.symbol); if (!coin) return;
-    t.current = coin.price;
-    t.pnl = ((coin.price / t.entry - 1) * (t.direction === "long" ? 1 : -1) * 100);
-    const targetHit = t.direction === "long" ? coin.price >= t.target : coin.price <= t.target;
-    const stopHit = t.direction === "long" ? coin.price <= t.stopLoss : coin.price >= t.stopLoss;
-    if (targetHit) { t.status = "target"; t.closedAt = now; changed = true; linkedToast(`${t.symbol} 模拟跟踪已达到目标`); pushNotify(`${t.symbol} 模拟跟踪已达目标 🎯`, `${t.direction === "long" ? "多" : "空"}单 入场 ${formatPrice(t.entry)} → 现价 ${formatPrice(coin.price)}，浮动 ${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}%`); }
-    else if (stopHit) { t.status = "invalid"; t.closedAt = now; changed = true; linkedToast(`${t.symbol} 模拟信号已失效`); pushNotify(`${t.symbol} 模拟跟踪已失效`, `${t.direction === "long" ? "多" : "空"}单 触发止损 ${formatPrice(t.stopLoss)}，浮动 ${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}%`); }
+    const st = ptUpdate(t, coin.price, btcNow, now);
+    if (!st) return;
+    changed = true;
+    const dirTxt = t.direction === "long" ? "多" : "空";
+    const netTxt = (t.net >= 0 ? "+" : "") + t.net.toFixed(2) + "%";
+    if (st === "target") { linkedToast(`${t.symbol} 模拟跟踪已达到目标`); pushNotify(`${t.symbol} 模拟跟踪已达目标 🎯`, `${dirTxt}单 入场 ${formatPrice(t.entry)} → ${formatPrice(t.exit)}，净 ${netTxt}`); }
+    else { linkedToast(`${t.symbol} 模拟信号已失效`); pushNotify(`${t.symbol} 模拟跟踪已失效`, `${dirTxt}单 触发止损 ${formatPrice(t.stopLoss)}，净 ${netTxt}`); }
   });
+  // 实时推送路径（每秒一次）：只有状态变化时才落盘重绘，其余时间只更新内存里的数值
+  if (opts && opts.fast && !changed) {
+    if (Date.now() - (window.__linkedPaintAt || 0) < 5000) return;
+    window.__linkedPaintAt = Date.now();
+  }
   saveLinkedState(s);
   renderLinkedSummary(); // 每 30 秒刷新现价/浮盈（此前仅在状态变化时刷新，浮盈长期不动）
 }
@@ -3493,7 +3518,7 @@ function renderRecommendCard(c, quality) {
     <div class="recommend-card-actions">
       <button onclick="event.stopPropagation();openLinkedAnalysis('${escapeJsAttr(sym)}','${directionCode}',${Number(c.score)},${Number(c.confidence)},'${escapeJsAttr(c.baseTf || "4h")}')">联动分析</button>
       <button class="${alerting ? "active" : ""}" onclick="event.stopPropagation();createPriceAlert('${escapeJsAttr(sym)}','${directionCode}',${entry})">${alerting ? "已设提醒" : "确认提醒"}</button>
-      <button class="${tracking ? "active" : ""}" onclick="event.stopPropagation();togglePaperTrack('${escapeJsAttr(sym)}','${directionCode}',${entry},${stopLoss},${target})">${tracking ? "停止模拟" : "模拟跟踪"}</button>
+      <button class="${tracking ? "active" : ""}" onclick="event.stopPropagation();togglePaperTrack('${escapeJsAttr(sym)}','${directionCode}',${entry},${stopLoss},${target},${tradeBlocked ? 1 : 0})">${tracking ? "停止模拟" : "模拟跟踪"}</button>
     </div>
   </div>`;
 }
