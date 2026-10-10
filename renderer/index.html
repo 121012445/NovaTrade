@@ -1050,6 +1050,9 @@ body {
 .ai-explain-head { display: flex; align-items: center; gap: var(--sp-2); font-weight: 600; font-size: var(--fs-sm); margin-bottom: 6px; }
 .ai-explain-text { font-size: var(--fs-sm); line-height: 1.8; color: var(--text-primary); }
 .ai-explain-meta { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
+.fa-wrap { margin: 0 0 var(--sp-4); }
+.fa-wrap .nt td, .fa-wrap .nt th { white-space: nowrap; }
+.fa-dim { color: var(--text-muted); font-size: 11px; }
 .rc-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 2px; }
 .rc-chip { display: inline-block; padding: 1px 7px; border-radius: var(--r-pill); font-size: 10px; background: var(--bg-primary); border: 1px solid var(--border-soft); color: var(--text-secondary); }
 .rc-chip.up { color: var(--positive); }
@@ -1243,6 +1246,7 @@ body {
   <script src="lib/realtime.js"></script>
   <script src="lib/shadow-model.js"></script>
   <script src="lib/portfolio-risk.js"></script>
+  <script src="lib/fwd-attribution.js"></script>
   <script src="lib/inline-handlers.js"></script>
   <script src="app.js"></script>
   <script src="settings.js"></script>

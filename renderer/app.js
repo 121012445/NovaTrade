@@ -2096,6 +2096,40 @@ function ledgerCell(res, dir, expired) {
   const cls = res.hit ? "up" : "down";
   return "<span class=\"" + cls + "\">" + (res.hit ? "命中" : "未中") + " " + (signed >= 0 ? "+" : "") + signed.toFixed(2) + "%</span>";
 }
+// 门控归因：每道门控拦下的信号，事后 4h 方向命中率是否真的比放行的差（见 lib/fwd-attribution.js）
+function gateAttributionHtml() {
+  if (typeof faAttribution !== "function") return "";
+  var A = faAttribution(fwdRecords || []);
+  if (!A.total) return "";
+  var pct = function (v) { return v === null || v === undefined || !isFinite(v) ? "--" : v.toFixed(0) + "%"; };
+  var ci = function (s) { return s && s.h4Ci ? '<span class="fa-dim">（' + s.h4Ci.lo.toFixed(0) + "–" + s.h4Ci.hi.toFixed(0) + "）</span>" : ""; };
+  var ret = function (v) { return isFinite(v) ? '<span class="' + (v >= 0 ? "up" : "down") + '">' + (v >= 0 ? "+" : "") + v.toFixed(2) + "%</span>" : "--"; };
+  var VERDICT = {
+    harmful: '<span class="bt-tag bad">拦下的反而更好</span>',
+    useful: '<span class="bt-tag ok">门控有效</span>',
+    unclear: '<span class="bt-tag warn">差异不显著</span>',
+    insufficient: '<span class="fa-dim">样本不足（每组需 ≥' + FA_MIN_N + '）</span>'
+  };
+  var row = function (label, s, verdict) {
+    if (!s || !s.n) return '<tr><td>' + label + '</td><td>0</td><td colspan="6" class="fa-dim">无记录</td><td></td></tr>';
+    return '<tr><td>' + label + '</td><td>' + s.n + '</td><td>' + pct(s.h1Rate) + '</td><td>' + pct(s.h4Rate) + ci(s) + '</td>' +
+      '<td>' + pct(s.bothHit) + '</td><td>' + pct(s.mixed) + '</td><td>' + pct(s.bothMiss) + '</td><td>' + ret(s.avgRet4h) + '</td><td>' + (verdict ? VERDICT[verdict] : "") + '</td></tr>';
+  };
+  var block = function (dir, title) {
+    var d = A.dirs[dir];
+    if (!d.passed.n && !d.blocked.n) return "";
+    return '<tr><th colspan="9" style="text-align:left">' + title + '</th></tr>' +
+      row("放行", d.passed, null) +
+      row("全部被拦截", d.blocked, d.overall) +
+      d.gates.map(function (g) { return g.any.n ? row("仅被「" + escapeHtml(g.label) + "」拦截", g.only, g.verdict) : ""; }).join("");
+  };
+  return '<div class="fa-wrap"><div class="mini-title">门控归因（' + A.total + ' 条 4h 已结算记录）</div>' +
+    '<div class="nt-wrap"><table class="nt"><thead><tr><th>分组</th><th>笔数</th><th>1h 命中</th><th>4h 命中（95% 区间）</th><th>1h/4h 都中</th><th>1h/4h 不一致</th><th>都不中</th><th>4h 方向收益</th><th>结论</th></tr></thead><tbody>' +
+    block("long", "多头信号") + block("short", "空头信号") + '</tbody></table></div>' +
+    '<div class="size-note">比较的是「放行」与「被拦截」两组在 4h 后的方向命中率，区间不重叠才下结论。「仅被某门控拦截」排除了其他门控的干扰。' +
+    '同一时段的信号高度同涨同跌（都跟着 BTC 走），所以有效样本比笔数少，结论要看得更保守。2026-10-09 之前的记录用的是旧版评分（含未收盘 K 线、MACD 偏差、残留的否决标记），与之后的记录不可直接比较。</div></div>';
+}
+window.gateAttributionHtml = gateAttributionHtml;
 function renderFwdLedger() {
   const box = document.getElementById("fwdLedger");
   if (!box) return;
@@ -2104,7 +2138,7 @@ function renderFwdLedger() {
   const rs = ledgerRows();
   const settled = all.filter(r => r.r4h).length;
   const expiredN = all.filter(r => r.expired && !r.r4h).length;
-  const head = ledgerFiltersHtml() +
+  const head = gateAttributionHtml() + ledgerFiltersHtml() +
     "<div class=\"vp-note\" style=\"margin-bottom:10px\">共 " + all.length + " 条信号（已结算 " + settled + "，待结算 " + (all.length - settled - expiredN) + (expiredN ? "，无数据 " + expiredN : "") + "）；" +
     "「被门控拦下的」= 记录了但当时风控门控没放行，用来对比“记了但没做”的口径质量。点任意一行可回到该币技术分析。</div>";
   if (rs.length === 0) { box.innerHTML = head + "<div class=\"linked-empty\">该筛选下暂无记录。</div>"; return; }
@@ -4134,7 +4168,7 @@ async function loadTrendIQAnalysis(symbol) {
       return `<div class="trendiq-pattern-item"><div class="trendiq-pattern-name">${escapeHtml(name)}</div><div class="trendiq-pattern-desc">${escapeHtml(desc)}</div><span class="trendiq-pattern-signal ${dir==='bullish'?'bullish':'bearish'}">${dir==='bullish'?'看涨':'看跌'}</span></div>`;
     }).join("") || "<div class=trendiq-loading><p>暂无形态</p></div>";
     // Risk/Reward：与主区风险回报标签页共用同一份多周期结论（analysis.riskReward 已是 4h 基底）
-    const rr = tradeBlocked ? null : (analysis.riskReward || calcRiskReward(analysis, ohlc));
+    const rr = tradeBlocked ? null : (analysis.riskReward || calcRiskReward(analysis, ohlc, analysis.livePrice));
     if (rr) {
     const rrDir = rr.direction === "long" ? "buy" : "sell";
     const rrDirText = rr.direction === "long" ? "做多" : "做空";

@@ -304,3 +304,19 @@ test('持仓页：组合风险概览显示集中度 / 杠杆 / 有效独立仓�
   assert.match(t, /方向高度单边/);
   assert.deepEqual(errors, []);
 });
+
+test('信号台账：门控归因表按方向显示放行 / 被拦截两组的命中率与结论', { skip }, async () => {
+  const recs = [];
+  const now = Date.now() - 6 * 3600e3;
+  const g = { overheat: true, dailyOK: true, stopCapVeto: false };
+  const p = { overheat: false, dailyOK: true, stopCapVeto: false };
+  for (let i = 0; i < 30; i++) recs.push({ ts: now - i * 60e3, symbol: 'AUSDT', dir: 'long', score: 66, price: 1, gated: true, gates: p, resolved: true, r1h: { price: 1, pct: 0.1, hit: i < 10 }, r4h: { price: 1, pct: i < 9 ? 1 : -1, hit: i < 9 } });
+  for (let i = 0; i < 30; i++) recs.push({ ts: now - i * 60e3, symbol: 'BUSDT', dir: 'long', score: 72, price: 1, gated: false, gates: g, resolved: true, r1h: { price: 1, pct: 0.1, hit: true }, r4h: { price: 1, pct: i < 25 ? 1 : -1, hit: i < 25 } });
+  const { page } = await open(`window.__fwdStore = ${JSON.stringify(recs)};`);
+  await page.click(`[onclick="showView('recommend')"], [data-onclick="showView('recommend')"]`);
+  await page.waitForFunction(() => /门控归因/.test(document.getElementById('fwdLedger').innerText), null, { timeout: 15000 });
+  const t = await page.locator('#fwdLedger .fa-wrap').innerText();
+  assert.match(t, /多头信号/);
+  assert.match(t, /仅被「过热区（70–74 分不做多）」拦截/);
+  assert.match(t, /拦下的反而更好/);
+});

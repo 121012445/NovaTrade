@@ -165,6 +165,7 @@ function deriveLevels(a) {
 // 1006 做空门控①：BTC 明确偏多（ADX>25 且 score≥65）时，山寨做空一票否决（打 shortVeto 标记，
 // 由 calcRiskReward 据此拒绝给出做空建议）；对称 ±8 打分保留用于多头侧。
 function applyBtcRegime(a) {
+  a.shortVeto = false;   // 每次重新判定，不沿用复制来的旧标记
   const btc = window.__btcRegime;
   if (!btc || !isFinite(btc.adx) || btc.adx <= 25) return a;
   if (a.symbol === "BTCUSDT" || a.symbol === "BTCUSDC") return a;
