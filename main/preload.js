@@ -62,6 +62,11 @@ try {
     appInfo: () => ipcRenderer.invoke('app:info'),
     checkUpdate: () => ipcRenderer.invoke('update:check'),
     openReleases: () => ipcRenderer.invoke('app:openReleases'),
+    updateStatus: () => ipcRenderer.invoke('update:status'),
+    updateInstall: () => ipcRenderer.invoke('update:install'),
+    updateDownload: () => ipcRenderer.invoke('update:download'),
+    updateSetAuto: (on) => ipcRenderer.invoke('update:setAuto', on),
+    onUpdateStatus: (cb) => ipcRenderer.on('update:status', (e, s) => cb(s)),
     exportDiagnostics: () => ipcRenderer.invoke('diagnostics:export'),
     backupExport: (json, name) => ipcRenderer.invoke('backup:export', json, name),
     backupImport: () => ipcRenderer.invoke('backup:import')

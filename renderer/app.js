@@ -5864,14 +5864,66 @@ async function btDailySeries(sym) {
   return series;
 }
 function btCostOf(cfg, full) { return { fee: cfg.fee, slip: full.slip, funding: full.funding }; }
+// ===== 回测后台线程（lib/bt-worker.js）=====
+// 最耗时的「逐点打分收集信号」放到 Web Worker 里跑，界面不卡。Worker 创建失败、握手超时或运行出错时，
+// 自动退回主线程计算（结果完全一致，只是界面会稍卡），之后本次会话不再尝试 Worker。
+var __btWorker = null, __btWorkerState = "unknown", __btJobSeq = 0;
+function btWorkerReady() {
+  if (window.__btNoWorker || typeof Worker === "undefined") { __btWorkerState = "failed"; return Promise.resolve(null); }
+  if (__btWorkerState === "failed") return Promise.resolve(null);
+  if (__btWorkerState === "ok" && __btWorker) return Promise.resolve(__btWorker);
+  return new Promise(function (resolve) {
+    var w;
+    try { w = new Worker("lib/bt-worker.js"); } catch (e) { __btWorkerState = "failed"; console.warn("[bt] worker unavailable:", e && e.message); return resolve(null); }
+    var done = false;
+    var finish = function (ok) {
+      if (done) return; done = true;
+      clearTimeout(t); w.removeEventListener("message", onMsg);
+      if (ok) { __btWorker = w; __btWorkerState = "ok"; resolve(w); }
+      else { try { w.terminate(); } catch (e) {} __btWorkerState = "failed"; console.warn("[bt] worker handshake failed, using main thread"); resolve(null); }
+    };
+    var onMsg = function (ev) { if (ev.data && ev.data.pong === "hi") finish(true); };
+    var t = setTimeout(function () { finish(false); }, 4000);
+    w.addEventListener("message", onMsg);
+    w.addEventListener("error", function () { finish(false); });
+    w.postMessage({ ping: "hi" });
+  });
+}
+async function btCollectInWorker(kl, cfg, maxHoldRef, hooks) {
+  var w = await btWorkerReady();
+  if (!w) return btCollectSignals(kl, cfg, maxHoldRef, hooks);
+  var id = ++__btJobSeq;
+  return new Promise(function (resolve, reject) {
+    var poll = setInterval(function () { if (hooks && hooks.isAborted && hooks.isAborted()) w.postMessage({ abort: id }); }, 200);
+    var onMsg = function (ev) {
+      var m = ev.data || {};
+      if (m.id !== id) return;
+      if (m.progress !== undefined) { if (hooks && hooks.onProgress) hooks.onProgress(m.progress); return; }
+      clearInterval(poll); w.removeEventListener("message", onMsg); w.removeEventListener("error", onErr);
+      if (m.ok) resolve(m.res);
+      else if (m.error === "__aborted__") reject(new Error("__aborted__"));
+      else { console.warn("[bt] worker job failed, retry on main thread:", m.error); btCollectSignals(kl, cfg, maxHoldRef, hooks).then(resolve, reject); }
+    };
+    var onErr = function (e) {
+      clearInterval(poll); w.removeEventListener("message", onMsg); w.removeEventListener("error", onErr);
+      __btWorkerState = "failed"; __btWorker = null;
+      console.warn("[bt] worker crashed, retry on main thread:", e && e.message);
+      btCollectSignals(kl, cfg, maxHoldRef, hooks).then(resolve, reject);
+    };
+    w.addEventListener("message", onMsg);
+    w.addEventListener("error", onErr);
+    w.postMessage({ id: id, kl: kl, cfg: cfg, maxHoldRef: maxHoldRef, gates: gateCfg(), maxStopPct: typeof window.__maxStopPct === "number" ? window.__maxStopPct : undefined });
+  });
+}
+window.btWorkerState = function () { return __btWorkerState; };
 // 信号只依赖评分引擎（与止盈倍数 / 最长持有无关），所以按「币|周期|根数|步长|采集用的最长持有」缓存，参数扫描时复用
 async function btSignalsFor(sym, cfg, maxHoldRef, token, onProgress) {
-  var key = ["sig", sym, cfg.tf, cfg.bars, cfg.step, maxHoldRef].join("|");
+  var key = ["sig", sym, cfg.tf, cfg.bars, cfg.step, maxHoldRef, JSON.stringify(gateCfg())].join("|");
   var hit = window.__btFullCache[key];
   if (hit && Date.now() - hit.ts < BT_TTL) return hit;
   var kl = await btLoadBars(sym, cfg.tf, cfg.bars + cfg.step + maxHoldRef + 130);
   if (kl.length < BT_MIN_WARMUP + maxHoldRef + 20) throw new Error("样本不足：仅取到 " + kl.length + " 根已收盘 K 线");
-  var sc = await btCollectSignals(kl, Object.assign({ sym: sym }, cfg), maxHoldRef, {
+  var sc = await btCollectInWorker(kl, Object.assign({ sym: sym }, cfg), maxHoldRef, {
     isAborted: function () { return window.__btRun !== token; }, onProgress: onProgress
   });
   var out = { ts: Date.now(), kl: kl, signals: sc.signals, vetoed: sc.vetoed, bars: sc.bars };
@@ -5880,7 +5932,7 @@ async function btSignalsFor(sym, cfg, maxHoldRef, token, onProgress) {
 }
 async function btFullSim(sym, cfg, full, token, onProgress) {
   var cost = btCostOf(cfg, full);
-  var key = ["f2", sym, cfg.tf, cfg.bars, cfg.step, cost.fee, cost.slip, cost.funding, full.tpR, full.maxHold, full.useDaily ? 1 : 0, full.noOverlap ? 1 : 0].join("|");
+  var key = ["f2", sym, cfg.tf, cfg.bars, cfg.step, cost.fee, cost.slip, cost.funding, full.tpR, full.maxHold, full.useDaily ? 1 : 0, full.noOverlap ? 1 : 0, JSON.stringify(gateCfg())].join("|");
   var hit = window.__btFullCache[key];
   if (hit && Date.now() - hit.ts < BT_TTL) return hit;
   var sg = await btSignalsFor(sym, cfg, full.maxHold, token, onProgress);

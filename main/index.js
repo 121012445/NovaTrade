@@ -321,6 +321,13 @@ process.on('unhandledRejection', (reason) => {
 });
 let mainWindow = null, tray = null, widgetWindow = null, lastWidgetData = null;
 
+// Electron 35 起 console-message 的位置参数（level, message, …）已废弃，改为放在事件对象上，且 level 变成字符串。
+// 两种写法都兼容：新版本读事件对象，旧版本退回位置参数（数字 0–3）。
+function consoleArgs(e, lvl, m) {
+  if (e && typeof e.message === 'string') return { level: String(e.level || 'info'), message: e.message };
+  const map = { 0: 'debug', 1: 'info', 2: 'warning', 3: 'error' };
+  return { level: map[lvl] || 'info', message: String(m || '') };
+}
 function createWindow() {
   const displays = screen.getAllDisplays();
   const display = displays[0];
@@ -349,10 +356,10 @@ function createWindow() {
   mainWindow.webContents.on('did-finish-load', () => { log('[main] Page loaded'); fileLog('info', 'main window loaded'); });
   mainWindow.webContents.on('did-fail-load', (e, code, desc) => { log('[main] Load failed:', code, desc); fileLog('did-fail-load', 'code=' + code + ' desc=' + desc); });
   mainWindow.webContents.on('render-process-gone', (e, details) => { fileLog('render-gone', JSON.stringify(details)); });
-  mainWindow.webContents.on('console-message', (e, level, msg) => {
-    log('[main] Renderer:', msg.substring(0, 80));
-    // level: 0=verbose 1=info 2=warning 3=error
-    if (level >= 2) fileLog('renderer-' + (level === 3 ? 'error' : 'warn'), msg);
+  mainWindow.webContents.on('console-message', (e, lvl, m) => {
+    const c = consoleArgs(e, lvl, m);
+    log('[main] Renderer:', c.message.substring(0, 80));
+    if (c.level === 'error' || c.level === 'warning') fileLog('renderer-' + (c.level === 'error' ? 'error' : 'warn'), c.message);
   });
   // 【托盘修复配套】点关闭 = 隐藏到托盘，不真正销毁窗口。
   // 否则窗口销毁后托盘左键无从唤起（原代码把 mainWindow 置 null，托盘就"死"了）。
@@ -377,7 +384,7 @@ function createWidget() {
   });
   hardenWebContents(widgetWindow.webContents);
   widgetWindow.loadFile(WIDGET_PATH);
-  widgetWindow.webContents.on('console-message', (e, level, msg) => { log('[widget]', msg); });
+  widgetWindow.webContents.on('console-message', (e, lvl, m) => { log('[widget]', consoleArgs(e, lvl, m).message); });
   widgetWindow.webContents.on('did-finish-load', () => {
     if (lastWidgetData) {
       widgetWindow.webContents.send('widget:data', lastWidgetData);
@@ -748,14 +755,22 @@ const SAVE_KINDS = {
   json: { title: '导出备份', filters: [{ name: 'JSON', extensions: ['json'] }] },
   txt: { title: '导出诊断包', filters: [{ name: '文本', extensions: ['txt'] }] }
 };
+// Electron 43 起保存 / 打开对话框默认停在「下载」文件夹，且不再记住上次的目录：这里自己记住
+let lastDialogDir = null;
+function dialogDefault(name) {
+  let dir = lastDialogDir;
+  if (!dir) { try { dir = app.getPath('downloads'); } catch (e) { dir = ''; } }
+  return dir ? path.join(dir, name || '') : (name || '');
+}
 function saveWithDialog(kind, defaultName, dataOrBase64) {
   return new Promise((resolve) => {
     try {
       const k = SAVE_KINDS[kind];
       if (!k) return resolve({ ok: false, error: 'unsupported kind' });
-      const target = dialog.showSaveDialog(mainWindow || undefined, { title: k.title, defaultPath: defaultName, filters: k.filters });
+      const target = dialog.showSaveDialog(mainWindow || undefined, { title: k.title, defaultPath: dialogDefault(defaultName), filters: k.filters });
       Promise.resolve(target).then((res) => {
         if (!res || res.canceled || !res.filePath) return resolve({ ok: false, canceled: true });
+        lastDialogDir = path.dirname(res.filePath);
         try {
           if (kind === 'csv') fs.writeFileSync(res.filePath, '\ufeff' + String(dataOrBase64), 'utf8');   // 加 BOM，否则 Excel 打开中文会乱码
           else if (kind === 'png') fs.writeFileSync(res.filePath, Buffer.from(String(dataOrBase64).replace(/^data:image\/png;base64,/, ''), 'base64'));
@@ -814,7 +829,26 @@ ipcHandle('llm:setConfig', (e, cfg) => getLlm().setConfig(cfg));
 ipcHandle('llm:analyze', (e, payload) => getLlm().analyze(payload));
 
 ipcHandle('app:info', () => ({ version: app.getVersion(), packaged: app.isPackaged, platform: process.platform, softwareRendering: SOFTWARE_RENDER }));
+// ===== 自动更新（main/updater.js）=====
+const { createUpdater } = require('./updater');
+const updater = createUpdater({
+  app, log, fileLog,
+  send: (ch, payload) => { try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(ch, payload); } catch (e) {} }
+});
+function updateCfgFile() { return path.join(app.getPath('userData'), 'update_config.json'); }
+function readUpdateCfg() { try { const c = JSON.parse(fs.readFileSync(updateCfgFile(), 'utf8')); return { autoDownload: c.autoDownload !== false }; } catch (e) { return { autoDownload: true }; } }
+ipcHandle('update:status', () => updater.status());
+ipcHandle('update:install', () => updater.install());
+ipcHandle('update:download', () => updater.download());
+ipcHandle('update:setAuto', (e, on) => {
+  const v = !!on;
+  try { fs.writeFileSync(updateCfgFile(), JSON.stringify({ autoDownload: v })); } catch (err) {}
+  updater.setAutoDownload(v);
+  return v;
+});
+// 「检查更新」：先用 GitHub API 查最新发布（任何环境都能用，便于显示版本号），正式版里再交给 electron-updater 去下载
 ipcHandle('update:check', async () => {
+  updater.check().catch(() => {});
   return diag.checkUpdate({
     repo: UPDATE_REPO, current: app.getVersion(),
     request: (host, urlPath) => binanceHttp.requestJson({ family: 'generic:' + host, hosts: [host], path: urlPath, agent: agentFor(futuresProxy || spotProxy, 2), proxyKey: futuresProxy || spotProxy || 'direct', timeoutMs: 10000 })
@@ -843,9 +877,10 @@ ipcHandle('backup:export', (e, json, name) => {
 });
 ipcHandle('backup:import', async () => {
   try {
-    const res = await dialog.showOpenDialog(mainWindow || undefined, { title: '导入备份', properties: ['openFile'], filters: [{ name: 'JSON', extensions: ['json'] }] });
+    const res = await dialog.showOpenDialog(mainWindow || undefined, { title: '导入备份', defaultPath: dialogDefault(''), properties: ['openFile'], filters: [{ name: 'JSON', extensions: ['json'] }] });
     if (!res || res.canceled || !res.filePaths || !res.filePaths[0]) return { ok: false, canceled: true };
     const f = res.filePaths[0];
+    lastDialogDir = path.dirname(f);
     if (fs.statSync(f).size > BACKUP_MAX_BYTES) return { ok: false, error: '文件过大' };
     const data = JSON.parse(fs.readFileSync(f, 'utf8'));
     if (!data || typeof data !== 'object' || Array.isArray(data)) return { ok: false, error: '不是有效的备份文件' };
@@ -899,6 +934,7 @@ app.whenReady().then(async () => {
   }
   // 延迟创建托盘，确保主窗口句柄正常
   setTimeout(() => { createTray(); }, 1000);
+  try { updater.start(readUpdateCfg()); } catch (e) { fileLog('updater-start', e.message); }
 });
 // 【关键】托盘修复依赖主窗口保持存活：窗口真销毁后托盘左键就再也唤不回来。
 // 所以关闭按钮 = 隐藏到托盘（托盘菜单"退出"才是真退出）。

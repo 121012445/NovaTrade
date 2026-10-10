@@ -145,9 +145,10 @@ const MOCK_SCRIPT = `
 })();
 `;
 
-async function launch() {
+// extraArgs：额外的 Chromium 启动参数（例如 --allow-file-access-from-files，用来模拟 Electron 里 file:// 页面可以创建 Worker）
+async function launch(extraArgs) {
   const { chromium } = require(findPlaywright());
-  const browser = await chromium.launch({ executablePath: findChromium(), args: ['--no-sandbox', '--disable-gpu'] });
+  const browser = await chromium.launch({ executablePath: findChromium(), args: ['--no-sandbox', '--disable-gpu'].concat(extraArgs || []) });
   const ctx = await browser.newContext({ viewport: { width: 1500, height: 1000 } });
   return { browser, ctx };
 }

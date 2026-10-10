@@ -149,6 +149,7 @@
       '<div class="set-row"><button class="btn-ghost" onclick="checkUpdateNow()">检查更新</button>' +
       '<button class="btn-ghost" onclick="exportDiag()">导出诊断包</button>' +
       '<button class="btn-ghost" onclick="openReleasePage()">打开发布页</button></div>' +
+      '<div id="updateBox"></div>' +
       '<div id="aboutMsg" class="set-result"></div>' +
       '<div class="set-note">诊断包包含版本、代理状态与最近的错误日志，令牌 / 密钥 / 带参数的 URL 已脱敏，可以直接发给开发者排查问题。</div></div>';
   }
@@ -167,8 +168,11 @@
       if (a.llmGetConfig) S.llm = await a.llmGetConfig();
       if (a.accountGetConfig) S.account = await a.accountGetConfig();
     } catch (e) { console.warn("[settings] load failed:", e && e.message); }
+    var upd = null;
+    try { if (a.updateStatus) upd = await a.updateStatus(); } catch (e) {}
     root.innerHTML = pushCardHtml() + generalCardHtml() + gateCardHtml() + llmCardHtml() + accountCardHtml() + dataCardHtml() + aboutCardHtml() + disclaimerHtml();
     try {
+      paintUpdate(upd);
       var info = a.appInfo ? await a.appInfo() : null;
       var ds = window.__dataSource;
       var el = $("aboutInfo");
@@ -317,6 +321,34 @@
     if (r && r.ok) msg("aboutMsg", "已导出：" + r.path, true);
     else if (!(r && r.canceled)) msg("aboutMsg", (r && (r.error || r.__error)) || "导出失败", false);
   };
+  // ---------- 自动更新状态（main/updater.js 推送）----------
+  var UPDATE_TEXT = { idle: "", checking: "正在检查更新…", latest: "已是最新版本", available: "发现新版本", downloading: "正在下载更新", downloaded: "新版本已下载", error: "自动更新出错" };
+  function updateBoxHtml(st) {
+    if (!st) return "";
+    if (!st.available) return '<div class="set-note">自动更新组件未安装（需要执行 npm install），只能手动检查。</div>';
+    if (!st.packaged) return '<div class="set-note">开发模式下不自动更新；打包安装后会自动检查。</div>';
+    var line = UPDATE_TEXT[st.status] || "";
+    if (st.status === "available" || st.status === "downloaded") line += " " + esc(st.version || "");
+    if (st.status === "downloading") line += " " + (st.percent || 0) + "%";
+    if (st.status === "error") line += "：" + esc(st.error || "");
+    return '<div class="set-row">' +
+      '<label class="nf-check"><input type="checkbox" onchange="settingsSetAutoUpdate(this.checked)"' + (st.autoDownload ? " checked" : "") + '><span>发现新版本时自动在后台下载' + (st.canInstall ? "" : "（macOS 未签名版本只能手动下载）") + '</span></label>' +
+      (st.status === "available" && st.canInstall && !st.autoDownload ? '<button class="btn-ghost" onclick="settingsDownloadUpdate()">下载更新</button>' : "") +
+      (st.status === "downloaded" ? '<button class="btn-primary" onclick="settingsInstallUpdate()">重启并安装</button>' : "") +
+      '</div>' + (line ? '<div class="set-note">' + line + (st.status === "downloaded" ? "（不点也会在下次退出应用时自动安装）" : "") + '</div>' : "");
+  }
+  function paintUpdate(st) { var el = $("updateBox"); if (el) el.innerHTML = updateBoxHtml(st); }
+  window.settingsSetAutoUpdate = function (on) { var a = api(); if (a.updateSetAuto) a.updateSetAuto(!!on); };
+  window.settingsDownloadUpdate = function () { var a = api(); if (a.updateDownload) a.updateDownload(); };
+  window.settingsInstallUpdate = function () { var a = api(); if (a.updateInstall) a.updateInstall(); };
+  (function listenUpdates() {
+    var a = api(), told = false;
+    if (!a.onUpdateStatus) return;
+    a.onUpdateStatus(function (st) {
+      paintUpdate(st);
+      if (st && st.status === "downloaded" && !told) { told = true; toast("新版本 " + (st.version || "") + " 已下载，可在「设置 → 诊断与更新」重启安装"); }
+    });
+  })();
   window.openReleasePage = function () { var a = api(); if (a.openReleases) a.openReleases(); };
 
   // 启动后静默检查一次更新（每天最多一次；只提示，不自动下载 / 安装）
